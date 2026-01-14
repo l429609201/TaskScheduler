@@ -1,0 +1,11 @@
+[
+    {
+        "task_id": "1",
+        "webhook_url": "https://example.com/webhook",
+        "events": ["on_start", "on_success", "on_failure"],
+        "headers": {
+            "Content-Type": "application/json"
+        }
+    }
+]
+

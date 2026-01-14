@@ -1,0 +1,16 @@
+[
+    {
+        "id": "1",
+        "name": "示例任务",
+        "enabled": true,
+        "task_type": "command",
+        "command": "echo 'Hello World'",
+        "working_dir": "",
+        "schedule": "0 * * * *",
+        "timeout": 300,
+        "retry_count": 0,
+        "retry_interval": 60,
+        "continue_on_error": false
+    }
+]
+

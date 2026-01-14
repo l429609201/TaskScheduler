@@ -19,10 +19,9 @@ class SyncWorkerThread(QThread):
     file_completed = pyqtSignal(str, str, bool, int)  # file_path, action, success, bytes
     sync_finished = pyqtSignal(object)  # result
 
-    def __init__(self, engine, sync_items=None, parent=None):
+    def __init__(self, engine, parent=None):
         super().__init__(parent)
         self.engine = engine
-        self.sync_items = sync_items  # 预先比较好的同步项
         self._bytes_transferred = 0
 
     def run(self):
@@ -47,9 +46,9 @@ class SyncWorkerThread(QThread):
 
             self.engine.set_file_completed_callback(on_file_completed)
 
-            # 执行同步 - 传递预先比较好的同步项
-            logger.info(f"开始调用 engine.execute(), sync_items={len(self.sync_items) if self.sync_items else 'None'}")
-            result = self.engine.execute(self.sync_items)
+            # 执行同步
+            logger.info("开始调用 engine.execute()")
+            result = self.engine.execute()
             logger.info(f"engine.execute() 完成, success={result.success}")
             self.sync_finished.emit(result)
         except Exception as e:
@@ -66,23 +65,19 @@ class SyncWorkerThread(QThread):
 class SyncProgressDialog(QDialog):
     """同步进度对话框 - FreeFileSync 风格"""
 
-    def __init__(self, engine, total_files: int, total_bytes: int = 0, sync_items=None, parent=None):
+    def __init__(self, engine, total_files: int, total_bytes: int = 0, parent=None):
         super().__init__(parent)
         self.engine = engine
         self.total_files = total_files
         self.total_bytes = total_bytes
-        self.sync_items = sync_items or []  # 保存同步项列表
         self.start_time = time.time()
         self.transferred_bytes = 0
         self.processed_files = 0
         self.current_file = ""
         self._cancelled = False
         self.result = None
-        self._file_row_map = {}  # 文件路径 -> 表格行号的映射
-        self._file_items = {}  # 行号 -> QTableWidgetItem 映射
 
         self._init_ui()
-        self._populate_file_table()  # 预先填充文件表
         self._start_timer()
         
     def _init_ui(self):
@@ -147,19 +142,15 @@ class SyncProgressDialog(QDialog):
         layout.addWidget(stats_group)
         
         # ===== 底部：操作结果 =====
-        result_group = QGroupBox("同步文件列表")
+        result_group = QGroupBox("操作详情")
         result_layout = QVBoxLayout(result_group)
 
         self.result_table = QTableWidget()
-        self.result_table.setColumnCount(4)
-        self.result_table.setHorizontalHeaderLabels(["状态", "操作", "文件", "大小"])
-        self.result_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.result_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.result_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
-        self.result_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.result_table.setColumnCount(3)
+        self.result_table.setHorizontalHeaderLabels(["操作", "文件", "状态"])
+        self.result_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.result_table.setAlternatingRowColors(True)
-        self.result_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.result_table.setMinimumHeight(200)
+        self.result_table.setMaximumHeight(150)
         result_layout.addWidget(self.result_table)
 
         layout.addWidget(result_group)
@@ -180,57 +171,6 @@ class SyncProgressDialog(QDialog):
         btn_layout.addWidget(self.close_btn)
 
         layout.addLayout(btn_layout)
-
-    def _populate_file_table(self):
-        """预先填充文件表格"""
-        if not self.sync_items:
-            return
-
-        from core.models import FileAction
-
-        self.result_table.setRowCount(0)
-
-        # 只显示需要处理的文件（跳过 equal, skip, conflict）
-        items_to_show = [
-            item for item in self.sync_items
-            if item.action not in (FileAction.EQUAL, FileAction.SKIP, FileAction.CONFLICT)
-        ]
-
-        self.result_table.setRowCount(len(items_to_show))
-
-        for row, item in enumerate(items_to_show):
-            # 操作类型
-            action_map = {
-                FileAction.COPY_TO_TARGET: "复制→",
-                FileAction.COPY_TO_SOURCE: "←复制",
-                FileAction.UPDATE_TARGET: "更新→",
-                FileAction.UPDATE_SOURCE: "←更新",
-                FileAction.DELETE_TARGET: "删除→",
-                FileAction.DELETE_SOURCE: "←删除",
-            }
-            action_text = action_map.get(item.action, "未知")
-            self.result_table.setItem(row, 1, QTableWidgetItem(action_text))
-
-            # 文件路径
-            self.result_table.setItem(row, 2, QTableWidgetItem(item.relative_path))
-
-            # 文件大小
-            size = (item.source_file.size if item.source_file else 0) or \
-                   (item.target_file.size if item.target_file else 0)
-            self.result_table.setItem(row, 3, QTableWidgetItem(self._format_size(size)))
-
-            # 状态（初始为等待）
-            status_item = QTableWidgetItem("⏳ 等待")
-            status_item.setForeground(Qt.gray)
-            self.result_table.setItem(row, 0, status_item)
-
-            # 建立映射
-            self._file_row_map[item.relative_path] = row
-            self._file_items[row] = {
-                'status': status_item,
-                'action': action_text,
-                'path': item.relative_path
-            }
 
     def _start_timer(self):
         """启动更新定时器"""
@@ -276,38 +216,23 @@ class SyncProgressDialog(QDialog):
         self.files_label.setText(f"已处理: {current} / {self.total_files} 文件")
         self.transferred_label.setText(f"已传输: {self._format_size(self.transferred_bytes)}")
 
-        # 更新当前文件状态为"进行中"
-        self._update_file_status(self.current_file, "🔄 进行中", Qt.blue)
-
-    def _update_file_status(self, file_path: str, status_text: str, color):
-        """更新文件状态"""
-        # 提取文件路径（移除"处理: "前缀）
-        if file_path.startswith("处理: "):
-            file_path = file_path.replace("处理: ", "")
-
-        row = self._file_row_map.get(file_path)
-        if row is not None and row < self.result_table.rowCount():
-            status_item = self.result_table.item(row, 0)
-            if status_item:
-                status_item.setText(status_text)
-                status_item.setForeground(color)
-
     def add_result_row(self, action: str, file_path: str, success: bool, bytes_transferred: int = 0):
-        """更新文件操作结果"""
-        if success:
-            self._update_file_status(file_path, "✓ 成功", Qt.darkGreen)
-        else:
-            self._update_file_status(file_path, "✗ 失败", Qt.red)
+        """添加操作结果行"""
+        row = self.result_table.rowCount()
+        self.result_table.insertRow(row)
 
-        # 更新传输大小（如果成功）
-        if success and bytes_transferred > 0:
-            # 获取行
-            row = self._file_row_map.get(file_path)
-            if row is not None and row < self.result_table.rowCount():
-                size_item = self.result_table.item(row, 3)
-                if size_item:
-                    # 更新大小显示（添加已传输字节数）
-                    size_item.setText(f"{self._format_size(bytes_transferred)}")
+        self.result_table.setItem(row, 0, QTableWidgetItem(action))
+        self.result_table.setItem(row, 1, QTableWidgetItem(file_path))
+
+        status_item = QTableWidgetItem("✓ 成功" if success else "✗ 失败")
+        if success:
+            status_item.setForeground(Qt.darkGreen)
+        else:
+            status_item.setForeground(Qt.red)
+        self.result_table.setItem(row, 2, status_item)
+
+        # 滚动到最新行
+        self.result_table.scrollToBottom()
 
     def on_sync_finished(self, result):
         """同步完成"""
@@ -331,10 +256,14 @@ class SyncProgressDialog(QDialog):
 
     def _on_cancel(self):
         """取消同步"""
-        self._cancelled = True
-        self.engine.cancel()
-        self.cancel_btn.setEnabled(False)
-        self.current_file_label.setText("正在取消...")
+        from ui.message_box import MsgBox
+
+        # 确认是否取消
+        if MsgBox.question(self, "确认", "确定要取消同步任务吗？") == MsgBox.Yes:
+            self._cancelled = True
+            self.engine.cancel()
+            self.cancel_btn.setEnabled(False)
+            self.current_file_label.setText("正在取消...")
 
     def _format_time(self, seconds: float) -> str:
         """格式化时间"""
@@ -359,15 +288,11 @@ class SyncProgressDialog(QDialog):
         return f"{size:.1f} PB"
 
     def closeEvent(self, event):
-        """关闭事件"""
+        """关闭事件 - X按钮和关闭按钮效果一样，都是关闭窗口"""
+        # 如果同步还在进行中，先取消
         if not self.close_btn.isEnabled():
-            # 同步进行中，询问是否取消
-            from ui.message_box import MsgBox
-            if MsgBox.question(self, "确认", "同步正在进行中，确定要取消吗？"):
-                self._on_cancel()
-                event.ignore()  # 等待同步取消完成
-            else:
-                event.ignore()
-        else:
-            event.accept()
+            # 同步进行中，直接取消并关闭
+            self._cancelled = True
+            self.engine.cancel()
+        event.accept()
 

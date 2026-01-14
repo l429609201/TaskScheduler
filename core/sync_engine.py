@@ -647,21 +647,21 @@ class FileComparator:
     def _should_include(self, file_info: FileInfo) -> bool:
         """检查文件是否应该包含在同步中"""
         filter_rule = self.config.filter_rule
-        
+
         # 检查隐藏文件
         if not filter_rule.include_hidden and file_info.name.startswith('.'):
             return False
-        
+
         # 检查排除目录
         for exclude_dir in filter_rule.exclude_dirs:
             if exclude_dir in file_info.path.split('/'):
                 return False
-        
+
         # 检查排除模式
         for pattern in filter_rule.exclude_patterns:
             if fnmatch.fnmatch(file_info.name, pattern):
                 return False
-        
+
         # 检查包含模式（如果有的话）
         if filter_rule.include_patterns:
             matched = False
@@ -671,13 +671,25 @@ class FileComparator:
                     break
             if not matched:
                 return False
-        
+
         # 检查文件大小
         if filter_rule.min_size > 0 and file_info.size < filter_rule.min_size:
             return False
         if filter_rule.max_size > 0 and file_info.size > filter_rule.max_size:
             return False
-        
+
+        # 检查时间过滤（仅对文件，不对目录）
+        if not file_info.is_dir and file_info.mtime > 0:
+            time_range = filter_rule.get_time_range()
+            if time_range[0] is not None or time_range[1] is not None:
+                start_dt, end_dt = time_range
+                file_dt = datetime.fromtimestamp(file_info.mtime)
+
+                if start_dt is not None and file_dt < start_dt:
+                    return False
+                if end_dt is not None and file_dt > end_dt:
+                    return False
+
         return True
     
     def _compare_files(self, src: FileInfo, tgt: FileInfo,
@@ -810,34 +822,46 @@ class SyncEngine:
     def _should_include(self, file_info: FileInfo) -> bool:
         """检查文件是否应该包含在同步中"""
         filter_rule = self.config.filter_rule
-        
+
         # 检查是否为隐藏文件
         if not filter_rule.include_hidden and file_info.name.startswith('.'):
             return False
-        
+
         # 检查排除目录
         if file_info.is_dir:
             if file_info.name in filter_rule.exclude_dirs:
                 return False
-        
+
         # 检查文件大小限制
         if not file_info.is_dir:
             if filter_rule.min_size > 0 and file_info.size < filter_rule.min_size:
                 return False
             if filter_rule.max_size > 0 and file_info.size > filter_rule.max_size:
                 return False
-        
+
         # 检查包含模式
         if filter_rule.include_patterns and not file_info.is_dir:
             matched = any(fnmatch.fnmatch(file_info.name, p) for p in filter_rule.include_patterns)
             if not matched:
                 return False
-        
+
         # 检查排除模式
         if filter_rule.exclude_patterns:
             if any(fnmatch.fnmatch(file_info.name, p) for p in filter_rule.exclude_patterns):
                 return False
-        
+
+        # 检查时间过滤（仅对文件，不对目录）
+        if not file_info.is_dir and file_info.mtime > 0:
+            time_range = filter_rule.get_time_range()
+            if time_range[0] is not None or time_range[1] is not None:
+                start_dt, end_dt = time_range
+                file_dt = datetime.fromtimestamp(file_info.mtime)
+
+                if start_dt is not None and file_dt < start_dt:
+                    return False
+                if end_dt is not None and file_dt > end_dt:
+                    return False
+
         return True
     
     def _compare_files(self, source: FileInfo, target: FileInfo) -> bool:

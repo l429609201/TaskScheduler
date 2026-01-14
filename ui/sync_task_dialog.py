@@ -1514,10 +1514,10 @@ class SyncTaskDialog(QDialog):
             return
 
         # 创建进度对话框
-        progress_dialog = SyncProgressDialog(engine, count, total_bytes, self.preview_items, self)
+        progress_dialog = SyncProgressDialog(engine, count, total_bytes, self)
 
         # 创建工作线程
-        self._sync_worker = SyncWorkerThread(engine, self.preview_items, self)
+        self._sync_worker = SyncWorkerThread(engine, self)
 
         # 连接信号
         def on_progress(msg, current, total, bytes_transferred):
