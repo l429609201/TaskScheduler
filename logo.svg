@@ -1,0 +1,14 @@
+<svg width="200" height="200" viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- 背景圆角矩形 -->
+  <rect width="100" height="100" rx="20" fill="#4F46E5"/>
+  
+  <!-- 外圈时钟感 -->
+  <circle cx="50" cy="50" r="35" stroke="white" stroke-width="6" stroke-dasharray="10 5"/>
+  
+  <!-- 内部任务列表与勾选 -->
+  <path d="M35 45L45 55L65 35" stroke="white" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+  
+  <!-- 底部进度装饰 -->
+  <rect x="30" y="70" width="40" height="4" rx="2" fill="white" fill-opacity="0.5"/>
+  <rect x="30" y="70" width="25" height="4" rx="2" fill="white"/>
+</svg>
