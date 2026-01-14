@@ -766,13 +766,19 @@ class SyncEngine:
         self.target_connector: Optional[FileConnector] = None
         self._cancel_flag = False
         self._progress_callback: Optional[Callable[[str, int, int], None]] = None
+        self._file_completed_callback: Optional[Callable[[str, str, bool, int], None]] = None
         self._lock = threading.Lock()
         self._current_file = ""
         self._processed_count = 0
+        self._transferred_bytes = 0  # 追踪传输的字节数
 
     def set_progress_callback(self, callback: Callable[[str, int, int], None]):
         """设置进度回调: callback(message, current, total)"""
         self._progress_callback = callback
+
+    def set_file_completed_callback(self, callback: Callable[[str, str, bool, int], None]):
+        """设置文件完成回调: callback(file_path, action, success, bytes_transferred)"""
+        self._file_completed_callback = callback
 
     def cancel(self):
         """取消同步"""
@@ -888,6 +894,7 @@ class SyncEngine:
         result = SyncResult()
         self._cancel_flag = False
         self._processed_count = 0
+        self._transferred_bytes = 0  # 重置传输字节数
 
         if not self.source_connector or not self.target_connector:
             result.success = False
@@ -954,6 +961,7 @@ class SyncEngine:
                     data = self.source_connector.read_file(item.source_file.path)
                     self.target_connector.write_file(item.source_file.path, data)
                     bytes_transferred = len(data)
+                    self._transferred_bytes += bytes_transferred  # 更新总传输字节数
                     result.copied_files += 1
                     logger.debug(f"复制完成: {item.source_file.path}, {bytes_transferred} bytes")
 
@@ -963,6 +971,7 @@ class SyncEngine:
                     data = self.target_connector.read_file(item.target_file.path)
                     self.source_connector.write_file(item.target_file.path, data)
                     bytes_transferred = len(data)
+                    self._transferred_bytes += bytes_transferred  # 更新总传输字节数
                     result.copied_files += 1
 
                 elif action == FileAction.UPDATE_TARGET:
@@ -971,6 +980,7 @@ class SyncEngine:
                     data = self.source_connector.read_file(item.source_file.path)
                     self.target_connector.write_file(item.source_file.path, data)
                     bytes_transferred = len(data)
+                    self._transferred_bytes += bytes_transferred  # 更新总传输字节数
                     result.updated_files += 1
 
                 elif action == FileAction.UPDATE_SOURCE:
@@ -979,6 +989,7 @@ class SyncEngine:
                     data = self.target_connector.read_file(item.target_file.path)
                     self.source_connector.write_file(item.target_file.path, data)
                     bytes_transferred = len(data)
+                    self._transferred_bytes += bytes_transferred  # 更新总传输字节数
                     result.updated_files += 1
 
                 elif action == FileAction.DELETE_TARGET:
@@ -1007,12 +1018,20 @@ class SyncEngine:
                 # 记录详细操作
                 result.details.append((action_name, file_path, True, bytes_transferred))
 
+                # 文件完成回调（实时更新UI）
+                if self._file_completed_callback:
+                    self._file_completed_callback(file_path, action_name, True, bytes_transferred)
+
             except Exception as e:
                 logger.error(f"处理文件失败 {item.relative_path}: {e}")
                 result.errors.append(f"{item.relative_path}: {e}")
                 result.failed_files += 1
                 # 记录失败操作
                 result.details.append((action_name or "错误", item.relative_path, False, 0))
+
+                # 文件完成回调（失败）
+                if self._file_completed_callback:
+                    self._file_completed_callback(item.relative_path, action_name or "错误", False, 0)
 
                 if not self.config.continue_on_error:
                     break

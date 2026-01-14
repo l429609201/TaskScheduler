@@ -22,7 +22,7 @@ from .background_output_dialog import ANSI_COLORS, ANSI_BG_COLORS, ANSI_ESCAPE_R
 
 
 class ExecutionThread(QThread):
-    """任务执行线程"""
+    """任务执行线程 - 支持命令任务和同步任务"""
     output_received = pyqtSignal(str, str)  # (text, type: 'stdout'/'stderr'/'info')
     execution_finished = pyqtSignal(int, float)  # (exit_code, duration)
 
@@ -33,9 +33,11 @@ class ExecutionThread(QThread):
         self.process = None
         self._stop_requested = False
         self._tracker = None
+        self._sync_engine = None
 
     def run(self):
-        """执行任务"""
+        """执行任务 - 根据任务类型选择执行方式"""
+        from core.models import TaskType
         from core.process_tracker import get_process_tracker
         self._tracker = get_process_tracker()
 
@@ -48,6 +50,18 @@ class ExecutionThread(QThread):
                 self._tracker.kill_task_processes(self.task.id)
                 self.output_received.emit("上次实例已终止\n", 'info')
 
+        # 根据任务类型执行
+        if self.task.task_type == TaskType.SYNC:
+            exit_code = self._run_sync_task()
+        else:
+            exit_code = self._run_command_task()
+
+        end_time = datetime.now()
+        duration = (end_time - start_time).total_seconds()
+        self.execution_finished.emit(exit_code, duration)
+
+    def _run_command_task(self):
+        """执行命令任务"""
         # 设置工作目录
         working_dir = self.task.working_dir
         if working_dir and not os.path.isabs(working_dir):
@@ -141,14 +155,84 @@ class ExecutionThread(QThread):
             if self._tracker:
                 self._tracker.unregister_task(self.task.id)
 
-        end_time = datetime.now()
-        duration = (end_time - start_time).total_seconds()
+        return exit_code
 
-        self.execution_finished.emit(exit_code, duration)
+    def _run_sync_task(self):
+        """执行同步任务"""
+        from core.sync_engine import SyncEngine
+
+        self.output_received.emit(f"开始执行同步任务: {self.task.name}\n", 'info')
+        self.output_received.emit("=" * 50 + "\n\n", 'info')
+
+        if not self.task.sync_config:
+            self.output_received.emit("错误: 同步配置为空\n", 'stderr')
+            return 1
+
+        try:
+            # 创建同步引擎
+            self._sync_engine = SyncEngine(
+                self.task.sync_config,
+                thread_count=self.task.sync_config.max_concurrent or 4
+            )
+
+            # 设置进度回调
+            def on_progress(msg, current, total):
+                self.output_received.emit(f"[{current}/{total}] {msg}\n", 'info')
+
+            self._sync_engine.set_progress_callback(on_progress)
+
+            # 执行同步流程
+            success, msg = self._sync_engine.connect()
+            if not success:
+                self.output_received.emit(f"连接失败: {msg}\n", 'stderr')
+                return 1
+
+            # 比较文件
+            self.output_received.emit("正在比较文件...\n", 'info')
+            sync_items = self._sync_engine.compare()
+            items_to_process = [
+                item for item in sync_items
+                if item.action.value not in ('equal', 'skip', 'conflict')
+            ]
+
+            total_files = len(items_to_process)
+            self.output_received.emit(f"发现 {total_files} 个文件需要同步\n", 'info')
+
+            if total_files == 0:
+                self._sync_engine.disconnect()
+                self.output_received.emit("\n所有文件已是最新，无需同步\n", 'info')
+                return 0
+
+            # 执行同步
+            result = self._sync_engine.execute(sync_items)
+            self._sync_engine.disconnect()
+
+            # 显示结果
+            self.output_received.emit("\n" + "=" * 50 + "\n", 'info')
+            self.output_received.emit(f"同步完成\n", 'info')
+            self.output_received.emit(f"复制: {result.copied_files}  更新: {result.updated_files}  删除: {result.deleted_files}\n", 'info')
+            self.output_received.emit(f"失败: {result.failed_files}  跳过: {result.skipped_files}\n", 'info')
+
+            if result.errors:
+                self.output_received.emit(f"\n错误信息:\n", 'stderr')
+                for err in result.errors:
+                    self.output_received.emit(f"  - {err}\n", 'stderr')
+                return 1
+
+            return 0
+
+        except Exception as e:
+            import traceback
+            self.output_received.emit(f"\n同步执行异常: {e}\n", 'stderr')
+            self.output_received.emit(traceback.format_exc(), 'stderr')
+            return 1
 
     def stop(self):
         """停止执行"""
         self._stop_requested = True
+        # 如果是同步任务，设置取消标志
+        if self._sync_engine:
+            self._sync_engine.cancel()
         # 使用进程追踪器终止所有相关进程
         if self._tracker:
             self._tracker.kill_task_processes(self.task.id)

@@ -88,6 +88,7 @@ class BackgroundTaskManager:
         """保存执行日志"""
         from datetime import datetime
         from core.executor import ExecutionResult
+        from core.models import TaskType
 
         # 从缓冲区提取 stdout 和 stderr
         stdout_lines = []
@@ -118,15 +119,26 @@ class BackgroundTaskManager:
             full_output = result.stdout + "\n" + result.stderr
             parsed_vars = OutputParserEngine.parse_all(full_output, task.output_parsers)
 
-        # 记录日志
-        self._task_logger.log_execution(
-            task_id=task.id,
-            task_name=task.name,
-            command=task.command,
-            working_dir=task.working_dir,
-            result=result,
-            parsed_vars=parsed_vars
-        )
+        # 根据任务类型记录日志
+        if task.task_type == TaskType.SYNC:
+            # 同步任务
+            self._task_logger.log_sync_execution(
+                task_id=task.id,
+                task_name=task.name,
+                sync_config=task.sync_config,
+                result=result,
+                parsed_vars=parsed_vars
+            )
+        else:
+            # 命令任务
+            self._task_logger.log_execution(
+                task_id=task.id,
+                task_name=task.name,
+                command=task.command,
+                working_dir=task.working_dir,
+                result=result,
+                parsed_vars=parsed_vars
+            )
 
     def is_running(self, task_id: str) -> bool:
         """检查任务是否在运行"""
@@ -647,7 +659,7 @@ class MainWindow(QMainWindow):
         )
 
         # 创建进度对话框
-        progress_dialog = SyncProgressDialog(engine, total_files, total_bytes, self)
+        progress_dialog = SyncProgressDialog(engine, total_files, total_bytes, items_to_process, self)
 
         # 创建工作线程 - 保存为对话框属性防止被垃圾回收
         # 传递预先比较好的同步项，避免重复比较
@@ -657,13 +669,18 @@ class MainWindow(QMainWindow):
         def on_progress(msg, current, total, bytes_transferred):
             progress_dialog.update_progress(msg, current, total, bytes_transferred)
 
+        def on_file_completed(file_path, action, success, bytes_transferred):
+            progress_dialog.add_result_row(action, file_path, success, bytes_transferred)
+
         def on_finished(result):
             engine.disconnect()
 
-            # 在对话框中显示详细操作
-            for detail in result.details:
-                action_name, file_path, success, _ = detail
-                progress_dialog.add_result_row(action_name, file_path, success)
+            # 更新所有未完成的文件为失败状态
+            for row in range(progress_dialog.result_table.rowCount()):
+                status_item = progress_dialog.result_table.item(row, 0)
+                if status_item and "进行中" in status_item.text():
+                    status_item.setText("✗ 失败")
+                    status_item.setForeground(Qt.red)
 
             progress_dialog.on_sync_finished(result)
 
@@ -732,6 +749,7 @@ class MainWindow(QMainWindow):
                 self.scheduler.notifier.notify_async(task.webhooks, params)
 
         progress_dialog.sync_worker.progress_updated.connect(on_progress)
+        progress_dialog.sync_worker.file_completed.connect(on_file_completed)
         progress_dialog.sync_worker.sync_finished.connect(on_finished)
 
         # 启动工作线程
@@ -747,15 +765,7 @@ class MainWindow(QMainWindow):
 
     def _run_task_background(self, task: Task):
         """无窗口后台执行任务"""
-        from core.models import TaskType
-
-        if task.task_type == TaskType.SYNC:
-            # 同步任务：使用调度器执行
-            self.scheduler.run_task_now(task.id)
-            self.statusBar().showMessage(f"同步任务 '{task.name}' 已在后台启动")
-            self._load_tasks()
-            return
-
+        # 统一使用后台任务管理器执行所有任务类型
         if self.bg_task_manager.is_running(task.id):
             # 任务已在运行，询问是否查看输出
             if MsgBox.question(self, "任务运行中",

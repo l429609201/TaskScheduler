@@ -1514,17 +1514,28 @@ class SyncTaskDialog(QDialog):
             return
 
         # 创建进度对话框
-        progress_dialog = SyncProgressDialog(engine, count, total_bytes, self)
+        progress_dialog = SyncProgressDialog(engine, count, total_bytes, self.preview_items, self)
 
         # 创建工作线程
-        self._sync_worker = SyncWorkerThread(engine, self)
+        self._sync_worker = SyncWorkerThread(engine, self.preview_items, self)
 
         # 连接信号
         def on_progress(msg, current, total, bytes_transferred):
             progress_dialog.update_progress(msg, current, total, bytes_transferred)
 
+        def on_file_completed(file_path, action, success, bytes_transferred):
+            progress_dialog.add_result_row(action, file_path, success, bytes_transferred)
+
         def on_finished(result):
             engine.disconnect()
+
+            # 更新所有未完成的文件为失败状态
+            for row in range(progress_dialog.result_table.rowCount()):
+                status_item = progress_dialog.result_table.item(row, 0)
+                if status_item and "进行中" in status_item.text():
+                    status_item.setText("✗ 失败")
+                    status_item.setForeground(Qt.red)
+
             progress_dialog.on_sync_finished(result)
 
             # 显示结果摘要
@@ -1560,6 +1571,7 @@ class SyncTaskDialog(QDialog):
             self.bottom_tabs.setTabText(self.preview_tab_index, "📋 预览结果 (0)")
 
         self._sync_worker.progress_updated.connect(on_progress)
+        self._sync_worker.file_completed.connect(on_file_completed)
         self._sync_worker.sync_finished.connect(on_finished)
 
         # 启动工作线程
