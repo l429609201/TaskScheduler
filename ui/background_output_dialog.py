@@ -326,10 +326,14 @@ class BackgroundOutputDialog(QDialog):
     
     def _stop_execution(self):
         """停止执行"""
-        if self.bg_manager:
-            self.bg_manager.stop_task(self.task.id)
-            self.status_label.setText("正在停止...")
-    
+        from ui.message_box import MsgBox
+
+        if MsgBox.question(self, "确认", "确定要停止执行吗？") == MsgBox.Yes:
+            if self.bg_manager:
+                self.bg_manager.stop_task(self.task.id)
+                self.status_label.setText("正在停止...")
+                self.stop_btn.setEnabled(False)
+
     def closeEvent(self, event):
         """关闭事件"""
         self.refresh_timer.stop()

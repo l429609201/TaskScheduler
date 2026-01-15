@@ -780,8 +780,16 @@ class MainWindow(QMainWindow):
 
     def _show_background_output(self, task: Task):
         """显示后台任务的输出窗口"""
-        from .background_output_dialog import BackgroundOutputDialog
-        dialog = BackgroundOutputDialog(self, task, self.bg_task_manager)
+        from core.models import TaskType
+
+        # 同步任务使用专门的进度对话框
+        if task.task_type == TaskType.SYNC:
+            from .background_sync_dialog import BackgroundSyncProgressDialog
+            dialog = BackgroundSyncProgressDialog(self, task, self.bg_task_manager)
+        else:
+            from .background_output_dialog import BackgroundOutputDialog
+            dialog = BackgroundOutputDialog(self, task, self.bg_task_manager)
+
         dialog.exec_()
         self._load_tasks()
 

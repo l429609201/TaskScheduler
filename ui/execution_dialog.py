@@ -328,9 +328,13 @@ class ExecutionDialog(QDialog):
 
     def _stop_execution(self):
         """停止执行"""
-        if self.thread and self.thread.isRunning():
-            self.thread.stop()
-            self.status_label.setText("正在停止...")
+        from ui.message_box import MsgBox
+
+        if MsgBox.question(self, "确认", "确定要停止执行吗？") == MsgBox.Yes:
+            if self.thread and self.thread.isRunning():
+                self.thread.stop()
+                self.status_label.setText("正在停止...")
+                self.stop_btn.setEnabled(False)
 
     def _update_time(self):
         """更新耗时显示"""

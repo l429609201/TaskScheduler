@@ -19,9 +19,10 @@ class SyncWorkerThread(QThread):
     file_completed = pyqtSignal(str, str, bool, int)  # file_path, action, success, bytes
     sync_finished = pyqtSignal(object)  # result
 
-    def __init__(self, engine, parent=None):
+    def __init__(self, engine, sync_items=None, parent=None):
         super().__init__(parent)
         self.engine = engine
+        self.sync_items = sync_items  # 预先比较好的同步项
         self._bytes_transferred = 0
 
     def run(self):
@@ -46,9 +47,9 @@ class SyncWorkerThread(QThread):
 
             self.engine.set_file_completed_callback(on_file_completed)
 
-            # 执行同步
+            # 执行同步 - 使用预先比较好的同步项
             logger.info("开始调用 engine.execute()")
-            result = self.engine.execute()
+            result = self.engine.execute(self.sync_items)
             logger.info(f"engine.execute() 完成, success={result.success}")
             self.sync_finished.emit(result)
         except Exception as e:
@@ -65,11 +66,12 @@ class SyncWorkerThread(QThread):
 class SyncProgressDialog(QDialog):
     """同步进度对话框 - FreeFileSync 风格"""
 
-    def __init__(self, engine, total_files: int, total_bytes: int = 0, parent=None):
+    def __init__(self, engine, total_files: int, total_bytes: int = 0, sync_items=None, parent=None):
         super().__init__(parent)
         self.engine = engine
         self.total_files = total_files
         self.total_bytes = total_bytes
+        self.sync_items = sync_items  # 预先比较好的同步项
         self.start_time = time.time()
         self.transferred_bytes = 0
         self.processed_files = 0
@@ -79,7 +81,7 @@ class SyncProgressDialog(QDialog):
 
         self._init_ui()
         self._start_timer()
-        
+
     def _init_ui(self):
         self.setWindowTitle("同步进度")
         self.setMinimumSize(550, 400)
