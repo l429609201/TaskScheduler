@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 文件同步引擎
 支持本地文件系统、FTP、SFTP 的文件同步
@@ -248,7 +249,7 @@ class LocalConnector(FileConnector):
     """本地文件系统连接器"""
 
     # 进度回调最小间隔（秒）- 降低 CPU 占用
-    PROGRESS_INTERVAL = 0.5  # 500ms（降低UI刷新频率）
+    PROGRESS_INTERVAL = 0.1  # 100ms
 
     def __init__(self, config: ConnectionConfig):
         super().__init__(config)
@@ -1273,7 +1274,7 @@ class SFTPConnector(FileConnector):
         优化点：
         1. prefetch 预读取 - 减少网络往返
         2. 2MB 大块读取 - 减少系统调用和循环次数
-        3. 节流回调（300ms）- 降低UI刷新频率
+        3. 节流回调（300ms） - 降低UI刷新频率
         """
         import os
         full_path = self._full_path(src_path)
@@ -1295,7 +1296,7 @@ class SFTPConnector(FileConnector):
         for retry in range(max_retries):
             try:
                 with self.sftp.open(full_path, 'rb') as remote_f:
-                    # 【优化1】预读取整个文件，减少网络往返
+                    # 【优化】预读取整个文件，减少网络往返
                     if file_size > 0:
                         remote_f.prefetch(file_size)
 
@@ -1309,7 +1310,7 @@ class SFTPConnector(FileConnector):
                             if self._cancel_flag:
                                 raise InterruptedError("用户取消传输")
 
-                            # 【优化2】使用2MB大块读取，减少循环次数和系统调用
+                            # 【优化】使用2MB大块读取，减少循环次数和系统调用
                             chunk = remote_f.read(self.READ_CHUNK_SIZE)
                             if not chunk:
                                 break
@@ -1320,7 +1321,7 @@ class SFTPConnector(FileConnector):
                             bytes_transferred += chunk_size
                             current_pos += chunk_size
 
-                            # 【优化3】节流回调（300ms），降低CPU占用
+                            # 【优化】节流回调（300ms），降低CPU占用
                             self._throttled_progress(progress_callback, current_pos, file_size)
 
                 # 传输完成，强制更新一次进度
@@ -1356,7 +1357,7 @@ class SFTPConnector(FileConnector):
         优化点：
         1. pipelined 流水线写入 - 多个请求并发
         2. 2MB 大块写入 - 减少系统调用和循环次数
-        3. 节流回调（300ms）- 降低UI刷新频率
+        3. 节流回调（300ms） - 降低UI刷新频率
         """
         full_path = self._full_path(dst_path)
         bytes_transferred = 0
@@ -1381,7 +1382,7 @@ class SFTPConnector(FileConnector):
                         local_f.seek(current_pos)
 
                     with self.sftp.open(full_path, mode) as remote_f:
-                        # 【优化1】启用流水线写入，允许多个写入请求同时进行
+                        # 【优化】启用流水线写入，允许多个写入请求同时进行
                         remote_f.set_pipelined(True)
 
                         while True:
@@ -1389,7 +1390,7 @@ class SFTPConnector(FileConnector):
                             if self._cancel_flag:
                                 raise InterruptedError("用户取消传输")
 
-                            # 【优化2】使用2MB大块写入，减少循环次数和系统调用
+                            # 【优化】使用2MB大块写入，减少循环次数和系统调用
                             chunk = local_f.read(self.WRITE_CHUNK_SIZE)
                             if not chunk:
                                 break
@@ -1400,7 +1401,7 @@ class SFTPConnector(FileConnector):
                             bytes_transferred += chunk_size
                             current_pos += chunk_size
 
-                            # 【优化3】节流回调（300ms），降低CPU占用
+                            # 【优化】节流回调（300ms），降低CPU占用
                             self._throttled_progress(progress_callback, current_pos, file_size)
 
                 # 传输完成，强制更新一次进度
@@ -1460,16 +1461,443 @@ class SFTPConnector(FileConnector):
         return len(data)
 
 
-def create_connector(config: ConnectionConfig) -> FileConnector:
-    """根据配置创建连接器"""
-    if config.type == ConnectionType.LOCAL:
-        return LocalConnector(config)
-    elif config.type == ConnectionType.FTP:
-        return FTPConnector(config)
-    elif config.type == ConnectionType.SFTP:
-        return SFTPConnector(config)
-    else:
-        raise ValueError(f"不支持的连接类型: {config.type}")
+class AsyncSSHConnector(FileConnector):
+    """AsyncSSH 连接器 - 高性能异步 SFTP
+
+    性能优化：
+    1. 异步 I/O - 避免 GIL 限制
+    2. 大块传输（2MB）- 减少系统调用
+    3. 禁用压缩 - 降低 CPU 占用
+    4. 硬件加密加速 - AES-GCM 优先
+    5. 并发请求控制 - 避免服务器过载
+    """
+
+    # 性能配置
+    BLOCK_SIZE = 2 * 1024 * 1024  # 2MB 块大小
+    MAX_REQUESTS = 64  # 最大并发请求数
+    PROGRESS_INTERVAL = 0.3  # 300ms 进度更新间隔
+
+    def __init__(self, config: ConnectionConfig):
+        super().__init__(config)
+        self.conn = None
+        self.sftp = None
+        self.base_path = config.path or '/'
+        self._cancel_flag = False
+        self._last_progress_time = 0
+        self._loop = None  # 持久的 event loop
+        self._loop_thread = None  # loop 运行的线程
+
+    def cancel(self):
+        """取消当前传输"""
+        self._cancel_flag = True
+
+    def reset_cancel(self):
+        """重置取消标志"""
+        self._cancel_flag = False
+
+    def _run_async(self, coro):
+        """在同步代码中运行异步协程 - 使用持久的 event loop"""
+        import asyncio
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+        # 如果没有 loop，创建一个新的并保存
+        if self._loop is None or self._loop.is_closed():
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
+
+        try:
+            return self._loop.run_until_complete(coro)
+        except Exception as e:
+            logger.error(f"异步执行失败: {e}", exc_info=True)
+            raise
+
+    def connect(self) -> bool:
+        """连接到 SFTP 服务器"""
+        return self._run_async(self._async_connect())
+
+    async def _async_connect(self) -> bool:
+        """异步连接"""
+        import asyncssh
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+        try:
+            # 连接选项 - 使用更宽松的配置确保兼容性
+            options = asyncssh.SSHClientConnectionOptions(
+                # 禁用压缩
+                compression_algs=None,
+                # 加密算法 - 包含更多选项确保兼容性
+                encryption_algs=[
+                    'aes128-gcm@openssh.com',
+                    'aes256-gcm@openssh.com',
+                    'aes128-ctr',
+                    'aes192-ctr',
+                    'aes256-ctr',
+                    'aes128-cbc',  # 回退选项
+                    'aes192-cbc',
+                    'aes256-cbc',
+                ],
+                # 密钥交换算法 - 包含更多选项
+                kex_algs=[
+                    'curve25519-sha256',
+                    'curve25519-sha256@libssh.org',
+                    'ecdh-sha2-nistp256',
+                    'ecdh-sha2-nistp384',
+                    'ecdh-sha2-nistp521',
+                    'diffie-hellman-group14-sha256',
+                    'diffie-hellman-group16-sha512',
+                    'diffie-hellman-group14-sha1',  # 老服务器兼容
+                ],
+                # 接受所有主机密钥（生产环境应该验证）
+                known_hosts=None,
+            )
+
+            logger.info(f"AsyncSSH 连接到 {self.config.username}@{self.config.host}:{self.config.port}")
+
+            # 建立连接
+            if self.config.private_key_path:
+                logger.info(f"使用私钥认证: {self.config.private_key_path}")
+                self.conn = await asyncssh.connect(
+                    self.config.host,
+                    port=self.config.port,
+                    username=self.config.username,
+                    client_keys=[self.config.private_key_path],
+                    options=options,
+                    gss_host=None,  # 禁用 GSSAPI/Kerberos（避免 win32timezone 依赖）
+                )
+            else:
+                logger.info("使用密码认证")
+                self.conn = await asyncssh.connect(
+                    self.config.host,
+                    port=self.config.port,
+                    username=self.config.username,
+                    password=self.config.password,
+                    options=options,
+                    gss_host=None,  # 禁用 GSSAPI/Kerberos（避免 win32timezone 依赖）
+                )
+
+            logger.info("SSH 连接成功，启动 SFTP 客户端...")
+
+            # 启动 SFTP 客户端
+            self.sftp = await self.conn.start_sftp_client()
+
+            logger.info("SFTP 客户端启动成功")
+
+            # 切换到基础路径
+            if self.base_path and self.base_path != '/':
+                try:
+                    logger.info(f"切换到基础路径: {self.base_path}")
+                    await self.sftp.chdir(self.base_path)
+                except Exception as e:
+                    logger.warning(f"切换路径失败: {e}")
+
+            self._connected = True
+            logger.info("AsyncSSH 连接完全建立")
+            return True
+
+        except Exception as e:
+            logger.error(f"AsyncSSH 连接失败: {e}", exc_info=True)
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def disconnect(self):
+        """断开连接"""
+        import logging
+        import asyncio
+
+        logger = logging.getLogger(__name__)
+
+        try:
+            # 先关闭 SFTP 和连接
+            if self.sftp:
+                try:
+                    self.sftp = None
+                except:
+                    pass
+
+            if self.conn:
+                try:
+                    # 强制关闭底层连接
+                    if hasattr(self.conn, '_transport') and self.conn._transport:
+                        self.conn._transport.abort()
+                    self.conn = None
+                except Exception as e:
+                    logger.warning(f"强制关闭连接时出错: {e}")
+
+            # 清理并关闭 event loop
+            if self._loop and not self._loop.is_closed():
+                try:
+                    # 取消所有 pending tasks
+                    pending = asyncio.all_tasks(self._loop)
+                    for task in pending:
+                        task.cancel()
+                    # 等待所有 tasks 完成或取消
+                    if pending:
+                        self._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                except Exception as e:
+                    logger.warning(f"清理tasks失败: {e}")
+                finally:
+                    self._loop.close()
+                    self._loop = None
+
+            self._connected = False
+            logger.info("AsyncSSH 连接已断开")
+
+        except Exception as e:
+            logger.error(f"断开连接失败: {e}")
+
+    def _full_path(self, path: str) -> str:
+        """构建完整路径"""
+        if not path:
+            return self.base_path
+        if path.startswith('/'):
+            return path
+        return f"{self.base_path.rstrip('/')}/{path}"
+
+    def list_files(self, path: str = "") -> List[FileInfo]:
+        """列出文件"""
+        return self._run_async(self._async_list_files(path))
+
+    async def _async_list_files(self, path: str = "") -> List[FileInfo]:
+        """异步列出文件"""
+        import asyncssh
+        import logging
+        from datetime import datetime
+
+        logger = logging.getLogger(__name__)
+        files = []
+        full_path = self._full_path(path)
+
+        try:
+            items = await self.sftp.listdir(full_path)
+
+            for item in items:
+                item_path = f"{path}/{item}" if path else item
+                full_item_path = self._full_path(item_path)
+
+                try:
+                    attrs = await self.sftp.stat(full_item_path)
+
+                    # 获取 mtime（Unix 时间戳）
+                    mtime = attrs.mtime if hasattr(attrs, 'mtime') else 0
+
+                    # 调试：打印前3个文件的时间信息
+                    if len(files) < 3 and mtime > 0:
+                        logger.info(f"[AsyncSSH时间调试] 文件: {item}")
+                        logger.info(f"  - 原始 mtime (timestamp): {mtime}")
+                        logger.info(f"  - fromtimestamp (本地时间): {datetime.fromtimestamp(mtime)}")
+                        logger.info(f"  - utcfromtimestamp (UTC): {datetime.utcfromtimestamp(mtime)}")
+
+                    file_info = FileInfo(
+                        name=item,
+                        path=item_path,
+                        size=attrs.size if hasattr(attrs, 'size') else 0,
+                        mtime=mtime,
+                        is_dir=attrs.type == asyncssh.FILEXFER_TYPE_DIRECTORY if hasattr(attrs, 'type') else False
+                    )
+                    files.append(file_info)
+                except:
+                    continue
+
+        except Exception as e:
+            logger.error(f"列出文件失败: {e}")
+
+        return files
+
+    def _throttled_progress(self, callback, current, total, force=False):
+        """节流进度回调"""
+        if callback is None:
+            return
+
+        import time
+        now = time.time()
+        if force or (now - self._last_progress_time >= self.PROGRESS_INTERVAL):
+            self._last_progress_time = now
+            callback(current, total)
+
+    def read_file(self, path: str) -> bytes:
+        """读取文件内容（小文件用）"""
+        return self._run_async(self._async_read_file(path))
+
+    async def _async_read_file(self, path: str) -> bytes:
+        """异步读取文件"""
+        full_path = self._full_path(path)
+        return await self.sftp.read(full_path)
+
+    def write_file(self, path: str, data: bytes):
+        """写入文件（小文件用）"""
+        self._run_async(self._async_write_file(path, data))
+
+    async def _async_write_file(self, path: str, data: bytes):
+        """异步写入文件"""
+        full_path = self._full_path(path)
+        # 确保目录存在
+        parent = '/'.join(full_path.split('/')[:-1])
+        if parent:
+            try:
+                await self.sftp.makedirs(parent)
+            except:
+                pass
+        await self.sftp.write(full_path, data)
+
+    def stream_read_to_local(self, src_path: str, local_path: str, file_size: int = 0,
+                             start_pos: int = 0, progress_callback=None) -> int:
+        """下载文件到本地"""
+        return self._run_async(self._async_stream_read_to_local(
+            src_path, local_path, file_size, start_pos, progress_callback
+        ))
+
+    async def _async_stream_read_to_local(self, src_path: str, local_path: str,
+                                          file_size: int = 0, start_pos: int = 0,
+                                          progress_callback=None) -> int:
+        """异步下载文件"""
+        import os
+        full_path = self._full_path(src_path)
+
+        # 确保本地目录存在
+        local_dir = os.path.dirname(local_path)
+        if local_dir and not os.path.exists(local_dir):
+            os.makedirs(local_dir, exist_ok=True)
+
+        # 重置进度时间
+        self._last_progress_time = 0
+
+        try:
+            # 使用 AsyncSSH 的高性能 get 方法
+            # AsyncSSH progress_handler 签名: (src_path, dst_path, bytes_copied, total_bytes)
+            await self.sftp.get(
+                full_path,
+                local_path,
+                block_size=self.BLOCK_SIZE,
+                max_requests=self.MAX_REQUESTS,
+                progress_handler=lambda src, dst, bytes_copied, total_bytes: self._throttled_progress(
+                    progress_callback, bytes_copied, total_bytes
+                ) if not self._cancel_flag else None
+            )
+
+            # 获取实际传输的字节数
+            if os.path.exists(local_path):
+                return os.path.getsize(local_path) - start_pos
+            return 0
+
+        except Exception as e:
+            if self._cancel_flag:
+                raise InterruptedError("用户取消传输")
+            raise e
+
+    def stream_write_from_local(self, local_path: str, dst_path: str, file_size: int = 0,
+                                start_pos: int = 0, progress_callback=None) -> int:
+        """上传本地文件到远程"""
+        return self._run_async(self._async_stream_write_from_local(
+            local_path, dst_path, file_size, start_pos, progress_callback
+        ))
+
+    async def _async_stream_write_from_local(self, local_path: str, dst_path: str,
+                                             file_size: int = 0, start_pos: int = 0,
+                                             progress_callback=None) -> int:
+        """异步上传文件"""
+        import os
+        full_path = self._full_path(dst_path)
+
+        # 确保远程目录存在
+        parent = '/'.join(full_path.split('/')[:-1])
+        if parent:
+            try:
+                await self.sftp.makedirs(parent)
+            except:
+                pass
+
+        # 重置进度时间
+        self._last_progress_time = 0
+
+        try:
+            # 使用 AsyncSSH 的高性能 put 方法
+            # AsyncSSH progress_handler 签名: (src_path, dst_path, bytes_copied, total_bytes)
+            await self.sftp.put(
+                local_path,
+                full_path,
+                block_size=self.BLOCK_SIZE,
+                max_requests=self.MAX_REQUESTS,
+                progress_handler=lambda src, dst, bytes_copied, total_bytes: self._throttled_progress(
+                    progress_callback, bytes_copied, total_bytes
+                ) if not self._cancel_flag else None
+            )
+
+            # 获取实际传输的字节数
+            if file_size > 0:
+                return file_size - start_pos
+            return os.path.getsize(local_path) - start_pos
+
+        except Exception as e:
+            if self._cancel_flag:
+                raise InterruptedError("用户取消传输")
+            raise e
+
+    def delete_file(self, path: str):
+        """删除文件"""
+        self._run_async(self._async_delete_file(path))
+
+    async def _async_delete_file(self, path: str):
+        """异步删除文件"""
+        full_path = self._full_path(path)
+        await self.sftp.remove(full_path)
+
+    def delete_dir(self, path: str):
+        """删除目录"""
+        self._run_async(self._async_delete_dir(path))
+
+    async def _async_delete_dir(self, path: str):
+        """异步删除目录"""
+        full_path = self._full_path(path)
+        await self.sftp.rmdir(full_path)
+
+    def mkdir(self, path: str):
+        """创建目录"""
+        self._run_async(self._async_mkdir(path))
+
+    async def _async_mkdir(self, path: str):
+        """异步创建目录"""
+        full_path = self._full_path(path)
+        await self.sftp.makedirs(full_path)
+
+    def exists(self, path: str) -> bool:
+        """检查路径是否存在"""
+        return self._run_async(self._async_exists(path))
+
+    async def _async_exists(self, path: str) -> bool:
+        """异步检查路径是否存在"""
+        full_path = self._full_path(path)
+        try:
+            await self.sftp.stat(full_path)
+            return True
+        except:
+            return False
+
+    def get_file_info(self, path: str) -> Optional[FileInfo]:
+        """获取文件信息"""
+        return self._run_async(self._async_get_file_info(path))
+
+    async def _async_get_file_info(self, path: str) -> Optional[FileInfo]:
+        """异步获取文件信息"""
+        import asyncssh
+
+        full_path = self._full_path(path)
+        try:
+            attrs = await self.sftp.stat(full_path)
+            return FileInfo(
+                name=os.path.basename(path),
+                path=path,
+                size=attrs.size if hasattr(attrs, 'size') else 0,
+                mtime=attrs.mtime if hasattr(attrs, 'mtime') else 0,
+                is_dir=attrs.type == asyncssh.FILEXFER_TYPE_DIRECTORY if hasattr(attrs, 'type') else False
+            )
+        except:
+            return None
+
 
 
 class FileComparator:
@@ -1693,7 +2121,8 @@ def create_connector(config: ConnectionConfig) -> FileConnector:
     elif config.type == ConnectionType.FTP:
         return FTPConnector(config)
     elif config.type == ConnectionType.SFTP:
-        return SFTPConnector(config)
+        # 使用 AsyncSSH 替代 Paramiko，性能更好
+        return AsyncSSHConnector(config)
     else:
         raise ValueError(f"不支持的连接类型: {config.type}")
 
@@ -1701,7 +2130,7 @@ def create_connector(config: ConnectionConfig) -> FileConnector:
 class SyncEngine:
     """文件同步引擎 - 支持多线程"""
 
-    def __init__(self, config: SyncConfig, thread_count: int = 4):
+    def __init__(self, config: SyncConfig, thread_count: int = 2):
         self.config = config
         self.thread_count = max(1, min(thread_count, 16))  # 限制 1-16 线程
         self.source_connector: Optional[FileConnector] = None
@@ -1712,8 +2141,11 @@ class SyncEngine:
         self._lock = threading.Lock()
         self._current_file = ""
         self._processed_count = 0
-        self._transferred_bytes = 0  # 总传输字节数（所有线程累计）
-        self._thread_bytes = {}  # 每个线程当前文件的传输字节数 {thread_id: bytes}
+        self._transferred_bytes = 0  # 已完成文件的总字节数
+        self._thread_bytes = {}  # 每个线程当前正在传输的字节数 {thread_id: bytes}
+        self._start_time = 0  # 传输开始时间（用于计算速度）
+        self._last_progress_time = 0  # 上次进度更新时间
+        self._last_progress_bytes = 0  # 上次进度更新时的字节数
 
         # 连接池 - 为每个线程创建独立连接
         self._source_pool: List[FileConnector] = []
@@ -1727,12 +2159,6 @@ class SyncEngine:
     def set_file_completed_callback(self, callback: Callable[[str, str, bool, int], None]):
         """设置文件完成回调: callback(file_path, action, success, bytes_transferred)"""
         self._file_completed_callback = callback
-
-    def get_total_transferred_bytes(self) -> int:
-        """获取总传输字节数（包括已完成和正在传输的文件）"""
-        with self._lock:
-            # 已完成文件的字节数 + 所有正在传输文件的字节数
-            return self._transferred_bytes + sum(self._thread_bytes.values())
 
     def _create_connector(self, config: ConnectionConfig) -> Optional[FileConnector]:
         """创建单个连接器"""
@@ -1960,18 +2386,34 @@ class SyncEngine:
         with self._lock:
             self._thread_bytes[thread_id] = 0
 
-        # 设置传输进度回调 - 使用线程独立计数
-        def transfer_progress(transferred, total):
-            with self._lock:
-                # 更新当前线程的传输字节数
-                self._thread_bytes[thread_id] = transferred
-                # 计算所有线程的总传输字节数
-                total_transferred = self._transferred_bytes + sum(self._thread_bytes.values())
+        # 辅助函数：智能格式化文件大小
+        def format_size(size_bytes):
+            """智能格式化文件大小，自动选择合适的单位"""
+            for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+                if size_bytes < 1024:
+                    return f"{size_bytes:.1f} {unit}"
+                size_bytes /= 1024
+            return f"{size_bytes:.1f} PB"
 
-            if self._progress_callback:
+        # 设置传输进度回调 - 轻量级统计
+        def transfer_progress(transferred, total):
+            import time
+            # 更新当前线程的传输字节数
+            self._thread_bytes[thread_id] = transferred
+
+            # 节流：每1秒才更新一次进度（减少锁竞争和UI刷新）
+            current_time = time.time()
+            if current_time - self._last_progress_time >= 1.0 and self._progress_callback:
+                with self._lock:
+                    # 计算总传输字节数
+                    total_bytes = self._transferred_bytes + sum(self._thread_bytes.values())
+                    self._last_progress_time = current_time
+
+                # 在锁外格式化字符串和调用回调（减少锁时间）
                 percent = int(transferred * 100 / total) if total > 0 else 0
+                # 进度文本只显示当前文件和进度，速度和已传输在统计信息区域显示
                 self._progress_callback(
-                    f"传输: {file_path} ({percent}%)",
+                    f"[线程{thread_id+1}] 正在传输: {file_path} ({percent}%) BYTES:{total_bytes}",
                     self._processed_count,
                     result.total_files
                 )
@@ -1991,9 +2433,7 @@ class SyncEngine:
                     resume=True
                 )
                 with self._lock:
-                    # 累加到总字节数，清理线程计数
                     self._transferred_bytes += bytes_transferred
-                    self._thread_bytes[thread_id] = 0
                     result.copied_files += 1
                 logger.debug(f"[线程{thread_id+1}] 复制完成: {item.source_file.path}, {bytes_transferred} bytes")
 
@@ -2008,9 +2448,7 @@ class SyncEngine:
                     resume=True
                 )
                 with self._lock:
-                    # 累加到总字节数，清理线程计数
                     self._transferred_bytes += bytes_transferred
-                    self._thread_bytes[thread_id] = 0
                     result.copied_files += 1
                 logger.debug(f"[线程{thread_id+1}] 复制完成: {item.target_file.path}, {bytes_transferred} bytes")
 
@@ -2025,9 +2463,7 @@ class SyncEngine:
                     resume=True
                 )
                 with self._lock:
-                    # 累加到总字节数，清理线程计数
                     self._transferred_bytes += bytes_transferred
-                    self._thread_bytes[thread_id] = 0
                     result.updated_files += 1
                 logger.debug(f"[线程{thread_id+1}] 更新完成: {item.source_file.path}, {bytes_transferred} bytes")
 
@@ -2042,9 +2478,7 @@ class SyncEngine:
                     resume=True
                 )
                 with self._lock:
-                    # 累加到总字节数，清理线程计数
                     self._transferred_bytes += bytes_transferred
-                    self._thread_bytes[thread_id] = 0
                     result.updated_files += 1
                 logger.debug(f"[线程{thread_id+1}] 更新完成: {item.target_file.path}, {bytes_transferred} bytes")
 
@@ -2053,7 +2487,6 @@ class SyncEngine:
                 logger.debug(f"[线程{thread_id+1}] 删除目标: {item.target_file.path}")
                 target_conn.delete_file(item.target_file.path)
                 with self._lock:
-                    self._thread_bytes[thread_id] = 0  # 清理线程计数
                     result.deleted_files += 1
                 logger.debug(f"[线程{thread_id+1}] 删除完成: {item.target_file.path}")
 
@@ -2062,13 +2495,13 @@ class SyncEngine:
                 logger.debug(f"[线程{thread_id+1}] 删除源: {item.source_file.path}")
                 source_conn.delete_file(item.source_file.path)
                 with self._lock:
-                    self._thread_bytes[thread_id] = 0  # 清理线程计数
                     result.deleted_files += 1
                 logger.debug(f"[线程{thread_id+1}] 删除完成: {item.source_file.path}")
 
-            # 成功完成，清理线程计数
+            # 文件传输完成，清理该线程的字节计数
             with self._lock:
-                self._thread_bytes[thread_id] = 0
+                if thread_id in self._thread_bytes:
+                    del self._thread_bytes[thread_id]
 
             return action_name, file_path, True, bytes_transferred
 
@@ -2078,8 +2511,10 @@ class SyncEngine:
             error_msg = _safe_error_message(e)
 
             with self._lock:
-                self._thread_bytes[thread_id] = 0  # 失败时也清理线程计数
                 result.errors.append(f"{file_path}: {error_msg}")
+                # 清理该线程的字节计数
+                if thread_id in self._thread_bytes:
+                    del self._thread_bytes[thread_id]
             return action_name, file_path, False, 0
 
     def execute(self, sync_items: List[SyncItem] = None) -> SyncResult:
@@ -2088,11 +2523,16 @@ class SyncEngine:
         from concurrent.futures import ThreadPoolExecutor, as_completed
         logger = logging.getLogger(__name__)
 
+        import time
+
         result = SyncResult()
         self._cancel_flag = False
         self._processed_count = 0
-        self._transferred_bytes = 0  # 重置总传输字节数
+        self._transferred_bytes = 0  # 重置传输字节数
         self._thread_bytes = {}  # 重置线程字节计数
+        self._start_time = time.time()  # 记录开始时间
+        self._last_progress_time = 0  # 重置进度更新时间
+        self._last_progress_bytes = 0  # 重置进度字节数
 
         # 重置连接器的取消标志
         if self.source_connector and hasattr(self.source_connector, 'reset_cancel'):

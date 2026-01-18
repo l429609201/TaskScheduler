@@ -145,11 +145,14 @@ class BackgroundTaskManager:
         # 检查任务是否配置了 webhook
         if not task.webhook_ids:
             logger.info(f"[BackgroundTaskManager._send_webhook_notification] 任务没有配置webhook，跳过")
+            buffer.append(("\n[Webhook] 任务没有配置 webhook，跳过推送\n", 'info'))
             return
 
         from datetime import datetime
         from core.executor import ExecutionResult
         from core.models import TaskType, WebhookStorage, TaskStorage, SettingsStorage
+
+        buffer.append(("\n[Webhook] 开始处理 webhook 通知...\n", 'info'))
 
         # 从缓冲区提取 stdout 和 stderr
         stdout_lines = []
@@ -160,15 +163,34 @@ class BackgroundTaskManager:
             elif output_type == 'stderr':
                 stderr_lines.append(text)
 
+        stdout_text = ''.join(stdout_lines)
+        stderr_text = ''.join(stderr_lines)
+
+        # 解析同步任务的文件列表（从 DONE: 行中提取）
+        sync_details = []
+        if task.task_type == TaskType.SYNC:
+            import re
+            for line in stdout_text.split('\n'):
+                # 格式: DONE:SUCCESS/FAILED:操作:文件路径:字节数
+                match = re.match(r'DONE:(SUCCESS|FAILED):(.+?):(.+?)(?::(\d+))?$', line)
+                if match:
+                    status = match.group(1)
+                    action = match.group(2)
+                    file_path = match.group(3)
+                    bytes_count = int(match.group(4)) if match.group(4) else 0
+                    success = (status == 'SUCCESS')
+                    sync_details.append((action, file_path, success, bytes_count))
+
         # 创建 ExecutionResult 对象
         result = ExecutionResult(
             success=(exit_code == 0),
             exit_code=exit_code,
-            stdout=''.join(stdout_lines),
-            stderr=''.join(stderr_lines),
+            stdout=stdout_text,
+            stderr=stderr_text,
             start_time=start_time,
             end_time=datetime.now(),
-            duration=duration
+            duration=duration,
+            extra_data={'sync_details': sync_details} if sync_details else {}
         )
 
         # 获取 webhook 配置
@@ -176,9 +198,11 @@ class BackgroundTaskManager:
         webhooks = task.get_webhooks(webhook_storage)
 
         logger.info(f"[BackgroundTaskManager._send_webhook_notification] 获取到 {len(webhooks)} 个webhook配置")
+        buffer.append((f"[Webhook] 获取到 {len(webhooks)} 个 webhook 配置\n", 'info'))
 
         if not webhooks:
             logger.warning(f"[BackgroundTaskManager._send_webhook_notification] 无法找到webhook配置")
+            buffer.append(("[Webhook] 警告: 无法找到 webhook 配置\n", 'stderr'))
             return
 
         # 从调度器获取 notifier
@@ -201,13 +225,16 @@ class BackgroundTaskManager:
             params.update(parsed_vars)
 
         logger.info(f"[BackgroundTaskManager._send_webhook_notification] 准备发送webhook，参数: {list(params.keys())}")
+        buffer.append((f"[Webhook] 解析到 {len(sync_details)} 个文件操作记录\n", 'info'))
 
         # 异步发送 webhook
         try:
             scheduler.notifier.notify_async(webhooks, params)
             logger.info(f"[BackgroundTaskManager._send_webhook_notification] 已触发异步发送，共 {len(webhooks)} 个webhook")
+            buffer.append((f"[Webhook] 已触发异步发送，共 {len(webhooks)} 个 webhook\n", 'info'))
         except Exception as e:
             logger.error(f"[BackgroundTaskManager._send_webhook_notification] 发送webhook失败: {e}", exc_info=True)
+            buffer.append((f"[Webhook] 发送失败: {e}\n", 'stderr'))
 
     def _save_log(self, task: Task, buffer: list, exit_code: int, duration: float, start_time):
         """保存执行日志"""

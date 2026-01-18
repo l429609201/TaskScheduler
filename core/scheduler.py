@@ -44,12 +44,12 @@ class TaskScheduler:
             enabled=settings.log_enabled
         )
         
-        # 配置 APScheduler（降低线程池大小以减少CPU占用）
+        # 配置 APScheduler
         jobstores = {
             'default': MemoryJobStore()
         }
         executors = {
-            'default': ThreadPoolExecutor(5)  # 从10降到5，减少线程开销
+            'default': ThreadPoolExecutor(10)
         }
         job_defaults = {
             'coalesce': True,  # 合并错过的执行
@@ -120,9 +120,6 @@ class TaskScheduler:
         if task.task_type == TaskType.SYNC:
             # 同步任务
             result = self._execute_sync_task(task)
-        elif task.task_type == TaskType.CLEANUP:
-            # 清理任务
-            result = self._execute_cleanup_task(task)
         else:
             # 命令任务
             result = self.executor.execute(
@@ -160,7 +157,7 @@ class TaskScheduler:
                 result=result,
                 parsed_vars=parsed_vars
             )
-        elif task.task_type == TaskType.SYNC:
+        else:
             # 同步任务日志
             log_file = self.task_logger.log_sync_execution(
                 task_id=task.id,
@@ -169,17 +166,6 @@ class TaskScheduler:
                 result=result,
                 parsed_vars=parsed_vars
             )
-        elif task.task_type == TaskType.CLEANUP:
-            # 清理任务日志
-            log_file = self.task_logger.log_cleanup_execution(
-                task_id=task.id,
-                task_name=task.name,
-                cleanup_config=task.cleanup_config,
-                result=result,
-                parsed_vars=parsed_vars
-            )
-        else:
-            log_file = None
         if log_file:
             logger.info(f"执行日志已保存: {log_file}")
 
@@ -314,92 +300,7 @@ class TaskScheduler:
                 start_time=start_time,
                 end_time=datetime.now()
             )
-
-    def _execute_cleanup_task(self, task) -> 'ExecutionResult':
-        """执行清理任务"""
-        from core.cleanup_executor import CleanupExecutor
-        from core.executor import ExecutionResult
-
-        if not task.cleanup_config:
-            return ExecutionResult(
-                success=False,
-                exit_code=1,
-                stdout="",
-                stderr="清理配置为空",
-                start_time=datetime.now(),
-                end_time=datetime.now()
-            )
-
-        start_time = datetime.now()
-        stdout_lines = []
-        stderr_lines = []
-
-        try:
-            # 创建清理执行器
-            executor = CleanupExecutor()
-
-            # 设置进度回调
-            def on_progress(msg, current, total):
-                stdout_lines.append(f"[{current}/{total}] {msg}")
-
-            executor.set_progress_callback(on_progress)
-
-            # 执行清理
-            stdout_lines.append(f"开始清理任务...")
-            stdout_lines.append(f"目标目录: {task.cleanup_config.target_dir}")
-            stdout_lines.append(f"高阈值: {task.cleanup_config.high_threshold_gb} GB")
-            stdout_lines.append(f"低阈值: {task.cleanup_config.low_threshold_gb} GB")
-            stdout_lines.append("")
-
-            cleanup_result = executor.execute(task.cleanup_config)
-
-            # 输出结果
-            stdout_lines.append("")
-            stdout_lines.append("=" * 50)
-            if cleanup_result.skipped:
-                stdout_lines.append(f"✓ 跳过清理（未达到高阈值）")
-                stdout_lines.append(f"当前大小: {cleanup_result.initial_size_bytes / (1024**3):.2f} GB")
-            else:
-                stdout_lines.append(f"✓ 清理完成")
-                stdout_lines.append(f"初始大小: {cleanup_result.initial_size_bytes / (1024**3):.2f} GB")
-                stdout_lines.append(f"最终大小: {cleanup_result.final_size_bytes / (1024**3):.2f} GB")
-                stdout_lines.append(f"释放空间: {cleanup_result.deleted_size_bytes / (1024**3):.2f} GB")
-                stdout_lines.append(f"删除文件: {cleanup_result.deleted_count} 个")
-
-            if cleanup_result.errors:
-                stderr_lines.extend(cleanup_result.errors)
-
-            return ExecutionResult(
-                success=cleanup_result.success,
-                exit_code=0 if cleanup_result.success else 1,
-                stdout="\n".join(stdout_lines),
-                stderr="\n".join(stderr_lines),
-                start_time=start_time,
-                end_time=datetime.now(),
-                # 附加清理结果详情
-                extra_data={'cleanup_details': {
-                    'initial_size_gb': cleanup_result.initial_size_bytes / (1024**3),
-                    'final_size_gb': cleanup_result.final_size_bytes / (1024**3),
-                    'deleted_count': cleanup_result.deleted_count,
-                    'deleted_size_gb': cleanup_result.deleted_size_bytes / (1024**3),
-                    'skipped': cleanup_result.skipped
-                }}
-            )
-
-        except Exception as e:
-            import traceback
-            stderr_lines.append(f"清理执行异常: {str(e)}")
-            stderr_lines.append(traceback.format_exc())
-
-            return ExecutionResult(
-                success=False,
-                exit_code=1,
-                stdout="\n".join(stdout_lines),
-                stderr="\n".join(stderr_lines),
-                start_time=start_time,
-                end_time=datetime.now()
-            )
-
+    
     def add_task(self, task: Task) -> bool:
         """添加任务到调度器"""
         if not task.enabled:
@@ -502,24 +403,43 @@ class TaskScheduler:
         if result.stdout:
             import re
             for line in result.stdout.split('\n'):
-                if '复制文件:' in line:
-                    match = re.search(r'复制文件:\s*(\d+)', line)
+                # 支持两种格式：
+                # 1. "复制: 0  更新: 26  删除: 0" (后台任务格式)
+                # 2. "复制文件: 0" (调度器格式)
+
+                # 尝试匹配后台任务格式（一行包含多个统计）
+                match = re.search(r'复制:\s*(\d+)\s+更新:\s*(\d+)\s+删除:\s*(\d+)', line)
+                if match:
+                    copied = int(match.group(1))
+                    updated = int(match.group(2))
+                    deleted = int(match.group(3))
+                    continue
+
+                match = re.search(r'失败:\s*(\d+)\s+跳过:\s*(\d+)', line)
+                if match:
+                    failed = int(match.group(1))
+                    skipped = int(match.group(2))
+                    continue
+
+                # 尝试匹配调度器格式（每行一个统计）
+                if '复制文件:' in line or '复制:' in line:
+                    match = re.search(r'复制(?:文件)?:\s*(\d+)', line)
                     if match:
                         copied = int(match.group(1))
-                elif '更新文件:' in line:
-                    match = re.search(r'更新文件:\s*(\d+)', line)
+                elif '更新文件:' in line or '更新:' in line:
+                    match = re.search(r'更新(?:文件)?:\s*(\d+)', line)
                     if match:
                         updated = int(match.group(1))
-                elif '删除文件:' in line:
-                    match = re.search(r'删除文件:\s*(\d+)', line)
+                elif '删除文件:' in line or '删除:' in line:
+                    match = re.search(r'删除(?:文件)?:\s*(\d+)', line)
                     if match:
                         deleted = int(match.group(1))
-                elif '跳过文件:' in line:
-                    match = re.search(r'跳过文件:\s*(\d+)', line)
+                elif '跳过文件:' in line or '跳过:' in line:
+                    match = re.search(r'跳过(?:文件)?:\s*(\d+)', line)
                     if match:
                         skipped = int(match.group(1))
-                elif '失败文件:' in line:
-                    match = re.search(r'失败文件:\s*(\d+)', line)
+                elif '失败文件:' in line or '失败:' in line:
+                    match = re.search(r'失败(?:文件)?:\s*(\d+)', line)
                     if match:
                         failed = int(match.group(1))
                 elif '传输字节:' in line:

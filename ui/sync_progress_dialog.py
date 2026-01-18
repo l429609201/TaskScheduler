@@ -35,9 +35,10 @@ class SyncWorkerThread(QThread):
         try:
             # 设置进度回调
             def on_progress(msg, current, total):
-                # 获取总传输字节数（包括所有线程正在传输的文件）
-                total_bytes = self.engine.get_total_transferred_bytes()
-                logger.debug(f"进度回调: {msg}, {current}/{total}, 传输字节: {total_bytes}")
+                # 计算总传输字节数 = 已完成 + 所有线程正在传输的
+                with self.engine._lock:
+                    total_bytes = self.engine._transferred_bytes + sum(self.engine._thread_bytes.values())
+                logger.debug(f"进度回调: {msg}, {current}/{total}, 总传输字节: {total_bytes}")
                 self.progress_updated.emit(msg, current, total, total_bytes)
 
             self.engine.set_progress_callback(on_progress)
@@ -257,8 +258,8 @@ class SyncProgressDialog(QDialog):
         """更新进度"""
         self.processed_files = current
         self.current_file = message
-        if bytes_transferred > 0:
-            self.transferred_bytes = bytes_transferred
+        # 总是更新传输字节数（移除 if 条件）
+        self.transferred_bytes = bytes_transferred
 
         # 更新UI
         self.current_file_label.setText(message)
@@ -267,8 +268,15 @@ class SyncProgressDialog(QDialog):
         self.transferred_label.setText(f"已传输: {self._format_size(self.transferred_bytes)}")
 
         # 从 message 中提取文件路径，设置为传输中
+        # 支持新格式：[线程X] filename (XX%) | 速度: XX MB/s | 已传输: XX MB
         import re
-        if message.startswith("处理:") or message.startswith("传输:"):
+        # 匹配 [线程X] filename (XX%) 格式
+        thread_match = re.match(r'\[线程\d+\]\s*(.+?)\s*\(\d+%\)', message)
+        if thread_match:
+            file_path = thread_match.group(1).strip()
+            self._set_file_transferring(file_path)
+        # 兼容旧格式：处理: filename 或 传输: filename
+        elif message.startswith("处理:") or message.startswith("传输:"):
             path_match = re.match(r'(?:处理|传输):\s*(.+?)(?:\s*\(\d+%\))?$', message)
             if path_match:
                 file_path = path_match.group(1).strip()
