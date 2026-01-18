@@ -10,7 +10,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.jobstores.memory import MemoryJobStore
 from apscheduler.executors.pool import ThreadPoolExecutor
 
-from .models import Task, TaskStatus, TaskStorage, AppSettings, SettingsStorage, TaskType
+from .models import Task, TaskStatus, TaskStorage, AppSettings, SettingsStorage, TaskType, WebhookStorage
 from .executor import BatchExecutor, ExecutionResult
 from .webhook import WebhookNotifier
 from .logger import TaskLogger
@@ -20,17 +20,20 @@ logger = logging.getLogger(__name__)
 
 class TaskScheduler:
     """任务调度器"""
-    
-    def __init__(self, storage: TaskStorage = None, settings_storage: SettingsStorage = None):
+
+    def __init__(self, storage: TaskStorage = None, settings_storage: SettingsStorage = None,
+                 webhook_storage: WebhookStorage = None):
         """
         初始化调度器
 
         Args:
             storage: 任务存储实例
             settings_storage: 设置存储实例
+            webhook_storage: Webhook 存储实例
         """
         self.storage = storage or TaskStorage()
         self.settings_storage = settings_storage or SettingsStorage()
+        self.webhook_storage = webhook_storage or WebhookStorage()
         self.executor = BatchExecutor()
         self.notifier = WebhookNotifier()
 
@@ -174,7 +177,14 @@ class TaskScheduler:
                 logger.error(f"Task complete callback error: {e}")
 
         # 发送 webhook 通知（命令任务和同步任务都支持）
-        if task.webhooks:
+        # 从全局配置中获取实际的 webhook 配置
+        webhooks = task.get_webhooks(self.webhook_storage)
+        logger.info(f"任务 '{task.name}' webhook 数量: {len(webhooks)} (IDs: {task.webhook_ids})")
+
+        if webhooks:
+            for i, wh in enumerate(webhooks):
+                logger.info(f"  Webhook[{i}]: name='{wh.name}', enabled={wh.enabled}, url={wh.url[:50]}...")
+
             # 构建通知参数
             if task.task_type == TaskType.SYNC:
                 # 同步任务的通知参数
@@ -191,8 +201,13 @@ class TaskScheduler:
             # 异步发送 webhook，完成后记录结果
             # 使用闭包捕获 log_file 的值
             current_log_file = log_file
-            self.notifier.notify_async(task.webhooks, params,
+            self.notifier.notify_async(webhooks, params,
                 callback=lambda results, lf=current_log_file: self._log_webhook_results(lf, results))
+        else:
+            if task.webhook_ids:
+                logger.warning(f"任务 '{task.name}' 配置的 webhook IDs {task.webhook_ids} 在全局配置中未找到")
+            else:
+                logger.info(f"任务 '{task.name}' 没有配置 webhook，跳过推送")
 
     def _execute_sync_task(self, task) -> 'ExecutionResult':
         """执行同步任务"""
@@ -289,12 +304,13 @@ class TaskScheduler:
     def add_task(self, task: Task) -> bool:
         """添加任务到调度器"""
         if not task.enabled:
+            logger.info(f"任务 {task.name} 未启用，跳过添加到调度器")
             return True
-        
+
         try:
             cron_params = self._parse_cron(task.cron_expression)
             trigger = CronTrigger(**cron_params)
-            
+
             self._scheduler.add_job(
                 self._execute_task,
                 trigger=trigger,
@@ -303,10 +319,19 @@ class TaskScheduler:
                 name=task.name,
                 replace_existing=True
             )
-            logger.info(f"任务已添加到调度器: {task.name}")
+
+            # 获取下次执行时间
+            job = self._scheduler.get_job(task.id)
+            next_run = job.next_run_time if job else None
+            logger.info(f"✓ 任务已添加到调度器: {task.name}")
+            logger.info(f"  - Cron 表达式: {task.cron_expression}")
+            logger.info(f"  - Cron 参数: {cron_params}")
+            logger.info(f"  - 下次执行时间: {next_run}")
             return True
         except Exception as e:
-            logger.error(f"添加任务失败: {task.name}, 错误: {e}")
+            logger.error(f"✗ 添加任务失败: {task.name}, 错误: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return False
     
     def remove_task(self, task_id: str) -> bool:
@@ -537,7 +562,9 @@ class TaskScheduler:
             'success': result.success,
             'exit_code': result.exit_code,
             'start_time': result.start_time.strftime('%Y-%m-%d %H:%M:%S'),
+            'start_time_fmt': result.start_time.strftime('%Y-%m-%d %H:%M:%S'),  # 添加格式化的开始时间
             'end_time': result.end_time.strftime('%Y-%m-%d %H:%M:%S'),
+            'end_time_fmt': result.end_time.strftime('%Y-%m-%d %H:%M:%S'),  # 添加格式化的结束时间
             'duration': f"{result.duration:.2f}",
             'duration_str': f"{result.duration:.1f}秒",
             'duration_seconds': result.duration,

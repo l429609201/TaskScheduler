@@ -16,6 +16,12 @@ a = Analysis(
         'bcrypt',
         'nacl',
         'nacl.bindings',
+        # Windows COM 支持（用于任务计划程序）
+        'win32com',
+        'win32com.client',
+        'pythoncom',
+        # 工具模块
+        'utils.task_scheduler_manager',
     ],
     hookspath=[],
     hooksconfig={},

@@ -34,10 +34,11 @@ class SyncTaskDialog(QDialog):
         if not self.task.sync_config:
             self.task.sync_config = SyncConfig()
 
-        # Webhook 和解析器列表
-        self.webhooks = list(self.task.webhooks) if self.task.webhooks else []
-        self.output_parsers = list(self.task.output_parsers) if self.task.output_parsers else []
+        # Webhook 存储和已选择的 webhook IDs
         self.webhook_storage = WebhookStorage()
+        self.webhook_ids = list(self.task.webhook_ids) if self.task.webhook_ids else []
+        # 输出解析器列表
+        self.output_parsers = list(self.task.output_parsers) if self.task.output_parsers else []
 
         self._init_ui()
         self._load_task_data()
@@ -162,8 +163,8 @@ class SyncTaskDialog(QDialog):
         center_layout.addWidget(QLabel("同步线程:"))
         self.thread_spin = QSpinBox()
         self.thread_spin.setRange(1, 16)
-        self.thread_spin.setValue(4)
-        self.thread_spin.setToolTip("并发同步线程数 (1-16)")
+        self.thread_spin.setValue(2)  # 默认 2 线程，提高稳定性
+        self.thread_spin.setToolTip("并发同步线程数 (1-16)，建议设置为 2-4")
         center_layout.addWidget(self.thread_spin)
 
         main_layout.addWidget(center_widget)
@@ -358,7 +359,7 @@ class SyncTaskDialog(QDialog):
         webhook_btn_layout.addStretch()
         webhook_layout.addLayout(webhook_btn_layout)
 
-        bottom_tabs.addTab(webhook_tab, f"🔔 Webhooks ({len(self.webhooks)})")
+        bottom_tabs.addTab(webhook_tab, f"🔔 Webhooks ({len(self.webhook_ids)})")
         self.webhook_tab_index = 2
 
         # 输出解析选项卡
@@ -812,11 +813,13 @@ class SyncTaskDialog(QDialog):
                 if conn_type == ConnectionType.FTP.value or conn_type == "ftp":
                     from ftplib import FTP
                     ftp = FTP()
-                    ftp.encoding = 'gbk'
+                    # 使用 latin-1 作为初始编码，它能处理任何字节，避免解码错误
+                    ftp.encoding = 'latin-1'
                     ftp.connect(host, port, timeout=10)
                     ftp.login(username or "anonymous", password or "")
                     ftp.set_pasv(True)
                     connection['ftp'] = ftp
+                    connection['ftp_encoding'] = 'latin-1'  # 记录当前编码
                     return True
                 elif conn_type == ConnectionType.SFTP.value or conn_type == "sftp":
                     import paramiko
@@ -850,21 +853,39 @@ class SyncTaskDialog(QDialog):
                     pass
 
         def list_remote_dirs(path: str):
-            """列出远程目录下的子文件夹"""
+            """列出远程目录下的子文件夹（支持 GBK/UTF-8 自动编码）"""
             dirs = []
             try:
                 if connection['ftp']:
                     ftp = connection['ftp']
-                    try:
-                        ftp.cwd(path)
-                    except:
-                        ftp.encoding = 'utf-8'
-                        ftp.cwd(path)
 
-                    # 尝试 MLSD
-                    try:
-                        items = []
-                        ftp.retrlines('MLSD', lambda x: items.append(x))
+                    # 安全执行 FTP 命令，自动尝试多种编码
+                    def safe_ftp_list():
+                        encodings = ['latin-1', 'utf-8', 'gbk', 'gb2312']
+                        for enc in encodings:
+                            try:
+                                ftp.encoding = enc
+                                ftp.cwd(path)
+                                items = []
+                                ftp.retrlines('MLSD', lambda x: items.append(x))
+                                return items, 'mlsd'
+                            except UnicodeDecodeError:
+                                continue
+                            except Exception as e:
+                                # MLSD 不支持，尝试 LIST
+                                if 'mlsd' in str(e).lower() or '500' in str(e) or '502' in str(e):
+                                    try:
+                                        lines = []
+                                        ftp.retrlines('LIST', lambda x: lines.append(x))
+                                        return lines, 'list'
+                                    except UnicodeDecodeError:
+                                        continue
+                                continue
+                        return [], None
+
+                    items, mode = safe_ftp_list()
+
+                    if mode == 'mlsd':
                         for item in items:
                             parts = item.split(';')
                             name = parts[-1].strip()
@@ -877,11 +898,8 @@ class SyncTaskDialog(QDialog):
                                     facts[key.lower()] = val
                             if facts.get('type', '').lower() == 'dir':
                                 dirs.append(name)
-                    except:
-                        # LIST 回退
-                        lines = []
-                        ftp.retrlines('LIST', lambda x: lines.append(x))
-                        for line in lines:
+                    elif mode == 'list':
+                        for line in items:
                             if line.startswith('d'):
                                 parts = line.split()
                                 if len(parts) >= 9:
@@ -983,22 +1001,40 @@ class SyncTaskDialog(QDialog):
                 from datetime import datetime
 
                 ftp = FTP()
-                ftp.encoding = 'gbk'
+                # 使用 latin-1 作为初始编码，避免解码错误
+                ftp.encoding = 'latin-1'
                 ftp.connect(host, port, timeout=10)
                 ftp.login(username or "anonymous", password or "")
                 ftp.set_pasv(True)
 
-                try:
-                    ftp.cwd(path)
-                except:
-                    ftp.encoding = 'utf-8'
-                    ftp.cwd(path)
+                # 安全执行 FTP 命令，自动尝试多种编码
+                def safe_ftp_list():
+                    encodings = ['latin-1', 'utf-8', 'gbk', 'gb2312']
+                    for enc in encodings:
+                        try:
+                            ftp.encoding = enc
+                            ftp.cwd(path)
+                            items = []
+                            ftp.retrlines('MLSD', lambda x: items.append(x))
+                            return items, 'mlsd'
+                        except UnicodeDecodeError:
+                            continue
+                        except Exception as e:
+                            # MLSD 不支持，尝试 LIST
+                            err_str = str(e).lower()
+                            if 'mlsd' in err_str or '500' in str(e) or '502' in str(e):
+                                try:
+                                    lines = []
+                                    ftp.retrlines('LIST', lambda x: lines.append(x))
+                                    return lines, 'list'
+                                except UnicodeDecodeError:
+                                    continue
+                            continue
+                    return [], None
 
-                # 尝试 MLSD
-                try:
-                    items = []
-                    ftp.retrlines('MLSD', lambda x: items.append(x))
+                items, mode = safe_ftp_list()
 
+                if mode == 'mlsd':
                     for item in items:
                         parts = item.split(';')
                         name = parts[-1].strip()
@@ -1033,6 +1069,8 @@ class SyncTaskDialog(QDialog):
                         tree_item = QTreeWidgetItem()
                         tree_item.setText(0, ("📁 " if is_dir else "📄 ") + name)
                         tree_item.setData(0, Qt.UserRole, (0 if is_dir else 1, name.lower()))
+                        # 添加 tooltip 显示完整文件名
+                        tree_item.setToolTip(0, name)
 
                         size_val = int(size_str) if size_str else 0
                         if size_str and not is_dir:
@@ -1040,16 +1078,16 @@ class SyncTaskDialog(QDialog):
                         tree_item.setData(1, Qt.UserRole, -1 if is_dir else size_val)
 
                         if mtime > 0:
-                            tree_item.setText(2, datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M"))
+                            mtime_str = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
+                            tree_item.setText(2, mtime_str)
+                            # 添加 tooltip 显示完整时间（包含秒）
+                            tree_item.setToolTip(2, datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S"))
                         tree_item.setData(2, Qt.UserRole, mtime)
 
                         tree.addTopLevelItem(tree_item)
-                except:
-                    # LIST 回退
-                    lines = []
-                    ftp.retrlines('LIST', lambda x: lines.append(x))
 
-                    for line in lines:
+                elif mode == 'list':
+                    for line in items:
                         parts = line.split()
                         if len(parts) < 9:
                             continue
@@ -1062,6 +1100,8 @@ class SyncTaskDialog(QDialog):
                         tree_item = QTreeWidgetItem()
                         tree_item.setText(0, ("📁 " if is_dir else "📄 ") + name)
                         tree_item.setData(0, Qt.UserRole, (0 if is_dir else 1, name.lower()))
+                        # 添加 tooltip 显示完整文件名
+                        tree_item.setToolTip(0, name)
 
                         size_val = int(size_str) if size_str else 0
                         if size_str and not is_dir:
@@ -1097,13 +1137,18 @@ class SyncTaskDialog(QDialog):
                     tree_item = QTreeWidgetItem()
                     tree_item.setText(0, ("📁 " if is_dir else "📄 ") + attr.filename)
                     tree_item.setData(0, Qt.UserRole, (0 if is_dir else 1, attr.filename.lower()))
+                    # 添加 tooltip 显示完整文件名
+                    tree_item.setToolTip(0, attr.filename)
 
                     if not is_dir:
                         tree_item.setText(1, self._format_size(attr.st_size))
                     tree_item.setData(1, Qt.UserRole, -1 if is_dir else attr.st_size)
 
                     if mtime:
-                        tree_item.setText(2, datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M"))
+                        mtime_str = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
+                        tree_item.setText(2, mtime_str)
+                        # 添加 tooltip 显示完整时间（包含秒）
+                        tree_item.setToolTip(2, datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S"))
                     tree_item.setData(2, Qt.UserRole, mtime)
 
                     tree.addTopLevelItem(tree_item)
@@ -1456,10 +1501,24 @@ class SyncTaskDialog(QDialog):
         """添加预览行"""
         row = self.preview_table.rowCount()
         self.preview_table.insertRow(row)
-        self.preview_table.setItem(row, 0, QTableWidgetItem(action))
-        self.preview_table.setItem(row, 1, QTableWidgetItem(file_path))
-        self.preview_table.setItem(row, 2, QTableWidgetItem(source_info))
-        self.preview_table.setItem(row, 3, QTableWidgetItem(target_info))
+
+        # 操作列
+        action_item = QTableWidgetItem(action)
+        self.preview_table.setItem(row, 0, action_item)
+
+        # 文件路径列 - 添加 tooltip 显示完整路径
+        path_item = QTableWidgetItem(file_path)
+        path_item.setToolTip(file_path)
+        self.preview_table.setItem(row, 1, path_item)
+
+        # 源端信息列
+        source_item = QTableWidgetItem(source_info)
+        self.preview_table.setItem(row, 2, source_item)
+
+        # 目标端信息列
+        target_item = QTableWidgetItem(target_info)
+        self.preview_table.setItem(row, 3, target_item)
+
         self.preview_items.append((action, file_path))
 
     def _do_sync(self):
@@ -1513,15 +1572,27 @@ class SyncTaskDialog(QDialog):
             MsgBox.critical(self, "连接失败", msg)
             return
 
-        # 创建进度对话框
-        progress_dialog = SyncProgressDialog(engine, count, total_bytes, self)
+        # 初始化主窗口的进度显示
+        parent = self.parent()
+        if parent and hasattr(parent, 'update_task_progress'):
+            parent.update_task_progress(self.task.id, 0, "0/0")
 
-        # 创建工作线程
-        self._sync_worker = SyncWorkerThread(engine, self)
+        # 创建进度对话框 - 传入 sync_items 以显示文件列表
+        progress_dialog = SyncProgressDialog(engine, count, total_bytes, self.preview_items, self)
+
+        # 创建工作线程 - 传入 sync_items 以执行同步
+        self._sync_worker = SyncWorkerThread(engine, self.preview_items, self)
 
         # 连接信号
         def on_progress(msg, current, total, bytes_transferred):
             progress_dialog.update_progress(msg, current, total, bytes_transferred)
+
+            # 更新主窗口的进度显示
+            parent = self.parent()
+            if parent and hasattr(parent, 'update_task_progress'):
+                percent = int(current * 100 / total) if total > 0 else 0
+                status_text = f"{current}/{total}"
+                parent.update_task_progress(self.task.id, percent, status_text)
 
         def on_file_completed(file_path, action, success, bytes_transferred):
             progress_dialog.add_result_row(action, file_path, success, bytes_transferred)
@@ -1537,6 +1608,51 @@ class SyncTaskDialog(QDialog):
                     status_item.setForeground(Qt.red)
 
             progress_dialog.on_sync_finished(result)
+
+            # 清除主窗口的进度信息并刷新显示最终状态
+            if self.parent() and hasattr(self.parent(), '_task_progress'):
+                # 清除进度信息
+                if self.task.id in self.parent()._task_progress:
+                    del self.parent()._task_progress[self.task.id]
+                if self.task.id in self.parent()._task_progress_widgets:
+                    del self.parent()._task_progress_widgets[self.task.id]
+
+                # 触发主窗口刷新以显示最终状态（成功/失败）
+                from PyQt5.QtCore import QTimer
+                QTimer.singleShot(100, lambda: self.parent()._load_tasks() if hasattr(self.parent(), '_load_tasks') else None)
+
+            # 发送 webhook 通知
+            task = self.task
+            if task and task.webhook_ids:
+                from core.webhook import WebhookStorage
+                from core.executor import ExecutionResult
+                from datetime import datetime
+
+                webhook_storage = WebhookStorage()
+                webhooks = task.get_webhooks(webhook_storage)
+
+                if webhooks:
+                    # 构建执行结果
+                    duration = (result.end_time - result.start_time).total_seconds() if result.end_time and result.start_time else 0
+                    exec_result = ExecutionResult(
+                        success=result.success,
+                        exit_code=0 if result.success else 1,
+                        stdout=f"复制: {result.copied_files}, 更新: {result.updated_files}, 删除: {result.deleted_files}",
+                        stderr="\n".join(result.errors) if result.errors else "",
+                        start_time=result.start_time,
+                        end_time=result.end_time,
+                        duration=duration
+                    )
+
+                    # 获取调度器并发送通知
+                    from core.scheduler import TaskScheduler
+                    from core.models import TaskStorage, SettingsStorage
+                    storage = TaskStorage()
+                    settings_storage = SettingsStorage()
+                    scheduler = TaskScheduler(storage, settings_storage)
+
+                    params = scheduler._build_sync_notification_params(task, exec_result)
+                    scheduler.notifier.notify_async(webhooks, params)
 
             # 显示结果摘要
             if result.success:
@@ -1653,7 +1769,8 @@ class SyncTaskDialog(QDialog):
             compare_method=CompareMethod(self.compare_combo.currentData()),
             delete_extra=self.delete_extra_check.isChecked(),
             continue_on_error=self.continue_on_error_check.isChecked(),
-            filter_rule=filter_rule
+            filter_rule=filter_rule,
+            max_concurrent=self.thread_spin.value()
         )
 
     def _scan_local_folder(self, path: str, side: str):
@@ -1689,6 +1806,8 @@ class SyncTaskDialog(QDialog):
                 display_name = ("📁 " if is_dir else "📄 ") + item
                 tree_item.setText(0, display_name)
                 tree_item.setData(0, Qt.UserRole, (0 if is_dir else 1, item.lower()))  # 文件夹优先，然后按名称
+                # 添加 tooltip 显示完整文件名和路径
+                tree_item.setToolTip(0, item_path)
 
                 if not is_dir:
                     size = os.path.getsize(item_path)
@@ -1697,8 +1816,11 @@ class SyncTaskDialog(QDialog):
                 else:
                     tree_item.setData(1, Qt.UserRole, -1)  # 文件夹排在前面
 
-                tree_item.setText(2, datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M"))
+                mtime_str = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
+                tree_item.setText(2, mtime_str)
                 tree_item.setData(2, Qt.UserRole, mtime)  # 存储时间戳用于排序
+                # 添加 tooltip 显示完整时间（包含秒）
+                tree_item.setToolTip(2, datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S"))
 
                 tree.addTopLevelItem(tree_item)
         except Exception:
@@ -1717,13 +1839,18 @@ class SyncTaskDialog(QDialog):
             display_name = "📄 " + rel_path
             tree_item.setText(0, display_name)
             tree_item.setData(0, Qt.UserRole, (1, rel_path.lower()))  # 文件排序
+            # 添加 tooltip 显示完整文件路径
+            tree_item.setToolTip(0, rel_path)
 
             tree_item.setText(1, self._format_size(size))
             tree_item.setData(1, Qt.UserRole, size)
 
             if mtime:
-                tree_item.setText(2, datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M"))
+                mtime_str = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
+                tree_item.setText(2, mtime_str)
                 tree_item.setData(2, Qt.UserRole, mtime)
+                # 添加 tooltip 显示完整时间（包含秒）
+                tree_item.setToolTip(2, datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S"))
             else:
                 tree_item.setText(2, "--")
                 tree_item.setData(2, Qt.UserRole, 0)
@@ -1970,6 +2097,9 @@ class SyncTaskDialog(QDialog):
             self.delete_extra_check.setChecked(config.delete_extra)
             self.continue_on_error_check.setChecked(config.continue_on_error)
 
+            # 加载线程数
+            self.thread_spin.setValue(config.max_concurrent or 2)
+
             # 过滤规则
             if config.filter_rule:
                 # 加载包含规则到列表
@@ -2113,7 +2243,8 @@ class SyncTaskDialog(QDialog):
             compare_method=CompareMethod(self.compare_combo.currentData()),
             delete_extra=self.delete_extra_check.isChecked(),
             continue_on_error=self.continue_on_error_check.isChecked(),
-            filter_rule=filter_rule
+            filter_rule=filter_rule,
+            max_concurrent=self.thread_spin.value()
         )
 
         # 更新任务数据
@@ -2123,7 +2254,7 @@ class SyncTaskDialog(QDialog):
         self.task.cron_expression = cron
         self.task.enabled = self.enabled_check.isChecked()
         self.task.sync_config = sync_config
-        self.task.webhooks = self.webhooks
+        self.task.webhook_ids = self.webhook_ids  # 只保存 ID 引用
         self.task.output_parsers = self.output_parsers
 
         if not self.task.enabled:
@@ -2142,76 +2273,94 @@ class SyncTaskDialog(QDialog):
     def _refresh_global_webhooks(self):
         """刷新全局 Webhook 下拉列表"""
         self.global_webhook_combo.clear()
-        global_webhooks = self.webhook_storage.load_webhooks()
-        if not global_webhooks:
+        self._global_webhooks = self.webhook_storage.load_webhooks()
+        if not self._global_webhooks:
             self.global_webhook_combo.addItem("(无全局配置，请先在 Webhook 配置页面添加)", None)
         else:
-            for wh in global_webhooks:
+            for wh in self._global_webhooks:
                 self.global_webhook_combo.addItem(f"{wh.name} ({wh.url[:30]}...)", wh)
 
+    def _get_webhook_by_id(self, webhook_id: str):
+        """根据 ID 获取 webhook 配置"""
+        if not hasattr(self, '_global_webhooks'):
+            self._global_webhooks = self.webhook_storage.load_webhooks()
+        for wh in self._global_webhooks:
+            if wh.id == webhook_id:
+                return wh
+        return None
+
     def _refresh_webhook_table(self):
-        """刷新 Webhook 表格"""
-        self.webhook_table.setRowCount(len(self.webhooks))
-        for row, wh in enumerate(self.webhooks):
-            self.webhook_table.setItem(row, 0, QTableWidgetItem(wh.name))
-            url_display = wh.url[:40] + "..." if len(wh.url) > 40 else wh.url
-            self.webhook_table.setItem(row, 1, QTableWidgetItem(url_display))
-            self.webhook_table.setItem(row, 2, QTableWidgetItem(wh.method))
-            enabled_item = QTableWidgetItem("✓" if wh.enabled else "✗")
-            self.webhook_table.setItem(row, 3, enabled_item)
-        self.bottom_tabs.setTabText(self.webhook_tab_index, f"🔔 Webhooks ({len(self.webhooks)})")
+        """刷新 Webhook 表格 - 显示已选择的 webhook"""
+        # 确保全局 webhooks 已加载
+        if not hasattr(self, '_global_webhooks'):
+            self._global_webhooks = self.webhook_storage.load_webhooks()
+
+        self.webhook_table.setRowCount(len(self.webhook_ids))
+        for row, wid in enumerate(self.webhook_ids):
+            wh = self._get_webhook_by_id(wid)
+            if wh:
+                self.webhook_table.setItem(row, 0, QTableWidgetItem(wh.name))
+                url_display = wh.url[:40] + "..." if len(wh.url) > 40 else wh.url
+                self.webhook_table.setItem(row, 1, QTableWidgetItem(url_display))
+                self.webhook_table.setItem(row, 2, QTableWidgetItem(wh.method))
+                enabled_item = QTableWidgetItem("✓" if wh.enabled else "✗")
+                self.webhook_table.setItem(row, 3, enabled_item)
+            else:
+                # webhook 已被删除
+                self.webhook_table.setItem(row, 0, QTableWidgetItem(f"[已删除] {wid[:8]}..."))
+                self.webhook_table.setItem(row, 1, QTableWidgetItem("-"))
+                self.webhook_table.setItem(row, 2, QTableWidgetItem("-"))
+                self.webhook_table.setItem(row, 3, QTableWidgetItem("✗"))
+
+        self.bottom_tabs.setTabText(self.webhook_tab_index, f"🔔 Webhooks ({len(self.webhook_ids)})")
 
     def _add_from_global(self):
-        """从全局配置添加 Webhook"""
+        """从全局配置添加 Webhook（只保存 ID 引用）"""
         webhook = self.global_webhook_combo.currentData()
         if not webhook:
             MsgBox.warning(self, "提示", "请先在 Webhook 配置页面添加全局配置")
             return
 
         # 检查是否已添加
-        for wh in self.webhooks:
-            if wh.id == webhook.id:
-                MsgBox.warning(self, "提示", f"Webhook '{webhook.name}' 已添加")
-                return
+        if webhook.id in self.webhook_ids:
+            MsgBox.warning(self, "提示", f"Webhook '{webhook.name}' 已添加")
+            return
 
-        # 复制一份添加到任务
-        import copy
-        new_webhook = copy.deepcopy(webhook)
-        self.webhooks.append(new_webhook)
+        # 只保存 ID 引用
+        self.webhook_ids.append(webhook.id)
         self._refresh_webhook_table()
 
     def _add_webhook(self):
-        """添加 Webhook"""
-        from .webhook_dialog import WebhookDialog
-        dialog = WebhookDialog(self)
-        if dialog.exec_():
-            webhook = dialog.get_webhook()
-            self.webhooks.append(webhook)
-            self._refresh_webhook_table()
+        """添加 Webhook - 跳转到全局配置"""
+        MsgBox.info(self, "提示",
+            "请在主界面的「Webhook 配置」页面添加全局 Webhook，\n"
+            "然后在此处从下拉列表中选择添加。\n\n"
+            "这样可以让多个任务共享同一个 Webhook 配置，\n"
+            "修改全局配置后所有任务自动生效。")
 
     def _edit_webhook(self):
-        """编辑 Webhook"""
+        """编辑 Webhook - 跳转到全局配置"""
         row = self.webhook_table.currentRow()
         if row < 0:
             MsgBox.warning(self, "提示", "请先选择一个 Webhook")
             return
 
-        from .webhook_dialog import WebhookDialog
-        webhook = self.webhooks[row]
-        dialog = WebhookDialog(self, webhook)
-        if dialog.exec_():
-            self.webhooks[row] = dialog.get_webhook()
-            self._refresh_webhook_table()
+        MsgBox.info(self, "提示",
+            "请在主界面的「Webhook 配置」页面编辑全局 Webhook。\n\n"
+            "修改后所有使用该 Webhook 的任务都会自动更新。")
 
     def _delete_webhook(self):
-        """删除 Webhook"""
+        """从任务中移除 Webhook（不删除全局配置）"""
         row = self.webhook_table.currentRow()
         if row < 0:
             MsgBox.warning(self, "提示", "请先选择一个 Webhook")
             return
 
-        if MsgBox.question(self, "确认删除", f"确定要删除 Webhook '{self.webhooks[row].name}' 吗？"):
-            del self.webhooks[row]
+        wh = self._get_webhook_by_id(self.webhook_ids[row])
+        name = wh.name if wh else self.webhook_ids[row][:8]
+
+        if MsgBox.question(self, "确认移除", f"确定要从此任务中移除 Webhook '{name}' 吗？\n（不会删除全局配置）"):
+            del self.webhook_ids[row]
             self._refresh_webhook_table()
 
     # ==================== 输出解析器方法 ====================

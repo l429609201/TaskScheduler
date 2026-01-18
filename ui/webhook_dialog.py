@@ -57,35 +57,25 @@ class WebhookConfigDialog(QDialog):
 
         form_layout.addRow("URL:", url_layout)
 
-        # 钉钉加签设置
-        dingtalk_sign_layout = QHBoxLayout()
-        self.dingtalk_sign_check = QCheckBox("钉钉加签")
-        self.dingtalk_sign_check.setToolTip("启用钉钉机器人加签验证")
-        self.dingtalk_sign_check.stateChanged.connect(self._on_dingtalk_sign_check_changed)
-        dingtalk_sign_layout.addWidget(self.dingtalk_sign_check)
+        # 安全类型选择（统一管理钉钉和飞书签名）
+        security_layout = QHBoxLayout()
+        self.security_type_combo = QComboBox()
+        self.security_type_combo.addItems(["无", "钉钉安全", "飞书安全"])
+        self.security_type_combo.currentIndexChanged.connect(self._on_security_type_changed)
+        self.security_type_combo.setFixedWidth(120)
+        security_layout.addWidget(self.security_type_combo)
 
-        self.dingtalk_sign_secret_edit = QLineEdit()
-        self.dingtalk_sign_secret_edit.setPlaceholderText("SEC 开头的密钥")
-        self.dingtalk_sign_secret_edit.setEnabled(False)
-        dingtalk_sign_layout.addWidget(self.dingtalk_sign_secret_edit)
-        form_layout.addRow("钉钉安全:", dingtalk_sign_layout)
-
-        # 飞书签名校验设置
-        feishu_sign_layout = QHBoxLayout()
-        self.feishu_sign_check = QCheckBox("飞书签名")
-        self.feishu_sign_check.setToolTip("启用飞书机器人签名校验")
-        self.feishu_sign_check.stateChanged.connect(self._on_feishu_sign_check_changed)
-        feishu_sign_layout.addWidget(self.feishu_sign_check)
-
-        self.feishu_sign_secret_edit = QLineEdit()
-        self.feishu_sign_secret_edit.setPlaceholderText("签名校验密钥")
-        self.feishu_sign_secret_edit.setEnabled(False)
-        feishu_sign_layout.addWidget(self.feishu_sign_secret_edit)
-        form_layout.addRow("飞书安全:", feishu_sign_layout)
+        self.security_secret_edit = QLineEdit()
+        self.security_secret_edit.setPlaceholderText("请选择安全类型后输入对应密钥")
+        self.security_secret_edit.setEnabled(False)
+        security_layout.addWidget(self.security_secret_edit)
+        form_layout.addRow("安全设置:", security_layout)
 
         self.headers_edit = QTextEdit()
         self.headers_edit.setPlaceholderText('可选，JSON格式，例如:\n{"Authorization": "Bearer token", "Content-Type": "application/json"}')
         self.headers_edit.setMaximumHeight(60)
+        self.headers_edit.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.headers_edit.customContextMenuRequested.connect(lambda pos: self._show_context_menu(self.headers_edit, pos))
         form_layout.addRow("Headers:", self.headers_edit)
 
         layout.addLayout(form_layout)
@@ -110,6 +100,8 @@ class WebhookConfigDialog(QDialog):
             '  "message": "任务执行{status_cn}，耗时 {duration_str}"\n'
             '}'
         )
+        self.body_edit.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.body_edit.customContextMenuRequested.connect(lambda pos: self._show_context_menu(self.body_edit, pos))
         body_layout.addWidget(self.body_edit, 2)
 
         # 变量快捷按钮区
@@ -210,19 +202,65 @@ class WebhookConfigDialog(QDialog):
         scroll.setWidget(container)
         return scroll
 
+    def _show_context_menu(self, text_edit: QTextEdit, pos):
+        """显示汉化的右键菜单"""
+        from PyQt5.QtWidgets import QMenu
+
+        menu = QMenu(self)
+
+        # 撤销/重做
+        undo_action = menu.addAction("撤销")
+        undo_action.setEnabled(text_edit.document().isUndoAvailable())
+        undo_action.triggered.connect(text_edit.undo)
+
+        redo_action = menu.addAction("重做")
+        redo_action.setEnabled(text_edit.document().isRedoAvailable())
+        redo_action.triggered.connect(text_edit.redo)
+
+        menu.addSeparator()
+
+        # 剪切/复制/粘贴
+        cut_action = menu.addAction("剪切")
+        cut_action.setEnabled(text_edit.textCursor().hasSelection())
+        cut_action.triggered.connect(text_edit.cut)
+
+        copy_action = menu.addAction("复制")
+        copy_action.setEnabled(text_edit.textCursor().hasSelection())
+        copy_action.triggered.connect(text_edit.copy)
+
+        paste_action = menu.addAction("粘贴")
+        paste_action.triggered.connect(text_edit.paste)
+
+        delete_action = menu.addAction("删除")
+        delete_action.setEnabled(text_edit.textCursor().hasSelection())
+        delete_action.triggered.connect(lambda: text_edit.textCursor().removeSelectedText())
+
+        menu.addSeparator()
+
+        # 全选
+        select_all_action = menu.addAction("全选")
+        select_all_action.triggered.connect(text_edit.selectAll)
+
+        menu.exec_(text_edit.mapToGlobal(pos))
+
     def _insert_variable(self, var_name: str):
         """插入变量到 Body 编辑框"""
         cursor = self.body_edit.textCursor()
         cursor.insertText(f"{{{var_name}}}")
         self.body_edit.setFocus()
 
-    def _on_dingtalk_sign_check_changed(self, state):
-        """钉钉加签复选框状态改变"""
-        self.dingtalk_sign_secret_edit.setEnabled(state == Qt.Checked)
-
-    def _on_feishu_sign_check_changed(self, state):
-        """飞书签名复选框状态改变"""
-        self.feishu_sign_secret_edit.setEnabled(state == Qt.Checked)
+    def _on_security_type_changed(self, index):
+        """安全类型改变时的回调"""
+        if index == 0:  # 无
+            self.security_secret_edit.setEnabled(False)
+            self.security_secret_edit.setPlaceholderText("无需密钥")
+            self.security_secret_edit.clear()
+        elif index == 1:  # 钉钉安全
+            self.security_secret_edit.setEnabled(True)
+            self.security_secret_edit.setPlaceholderText("SEC 开头的钉钉加签密钥")
+        elif index == 2:  # 飞书安全
+            self.security_secret_edit.setEnabled(True)
+            self.security_secret_edit.setPlaceholderText("飞书签名校验密钥")
 
     def _generate_dingtalk_sign(self, secret: str) -> tuple:
         """生成钉钉加签参数"""
@@ -260,9 +298,10 @@ class WebhookConfigDialog(QDialog):
             MsgBox.warning(self, "提示", "请先输入 URL")
             return
 
-        # 钉钉加签处理
-        if self.dingtalk_sign_check.isChecked():
-            secret = self.dingtalk_sign_secret_edit.text().strip()
+        # 安全处理
+        security_type = self.security_type_combo.currentIndex()
+        if security_type == 1:  # 钉钉安全
+            secret = self.security_secret_edit.text().strip()
             if not secret:
                 MsgBox.warning(self, "提示", "请输入钉钉加签密钥")
                 return
@@ -317,6 +356,23 @@ class WebhookConfigDialog(QDialog):
         for key, value in test_params.items():
             body = body.replace(f"{{{key}}}", str(value))
 
+        # 飞书签名处理（在 body 中添加 timestamp 和 sign）
+        if security_type == 2:  # 飞书安全
+            secret = self.security_secret_edit.text().strip()
+            if not secret:
+                MsgBox.warning(self, "提示", "请输入飞书签名密钥")
+                return
+            timestamp, sign = self._generate_feishu_sign(secret)
+            # 飞书需要在 body 中添加 timestamp 和 sign
+            try:
+                body_dict = json.loads(body)
+                body_dict['timestamp'] = timestamp
+                body_dict['sign'] = sign
+                body = json.dumps(body_dict, ensure_ascii=False)
+            except json.JSONDecodeError:
+                MsgBox.warning(self, "错误", "飞书签名要求 Body 必须是有效的 JSON 格式")
+                return
+
         # 发送测试请求
         import requests
         method = self.method_combo.currentText()
@@ -360,16 +416,31 @@ class WebhookConfigDialog(QDialog):
         self.method_combo.setCurrentText(self.webhook.method)
         if self.webhook.headers:
             self.headers_edit.setPlainText(json.dumps(self.webhook.headers, indent=2, ensure_ascii=False))
-        self.body_edit.setPlainText(self.webhook.body_template)
+
+        # 设置默认 Body 模板（如果为空）
+        body_template = self.webhook.body_template
+        if not body_template or body_template == '{"task": "{task_name}", "status": "{status}", "output": "{output}", "exit_code": {exit_code}}':
+            # 使用新的钉钉 Markdown 模板
+            body_template = '''{
+  "msgtype": "markdown",
+  "markdown": {
+    "title": "{status_icon} {task_name} 同步 {status_cn}",
+    "text": "## {status_icon} {task_name} 同步{status_cn}\\n\\n**基本信息**\\n- 🕐 开始时间: {start_time_fmt}\\n- ⏱️ 耗时: {duration_str}\\n- 🖥️ 源服务器: {source_server}\\n- 📂 源路径: {source_path}\\n- 📁 目标路径: {target_path}\\n- 🔄 同步模式: {sync_mode}\\n\\n**同步统计**\\n- ✅ 复制: {copied_files} 个\\n- 🔄 更新: {updated_files} 个\\n- 🗑️ 删除: {deleted_files} 个\\n- ⏭️ 相同: {unchanged_files} 个\\n- ❌ 失败: {failed_files} 个\\n- 📊 传输大小: {transferred_size}\\n\\n**{sync_message}**\\n\\n**文件列表**\\n```\\n{file_list}\\n```"
+  }
+}'''
+
+        self.body_edit.setPlainText(body_template)
         self.enabled_check.setChecked(self.webhook.enabled)
-        # 加载钉钉加签配置
-        self.dingtalk_sign_check.setChecked(self.webhook.dingtalk_sign_enabled)
-        self.dingtalk_sign_secret_edit.setText(self.webhook.dingtalk_sign_secret)
-        self.dingtalk_sign_secret_edit.setEnabled(self.webhook.dingtalk_sign_enabled)
-        # 加载飞书签名配置
-        self.feishu_sign_check.setChecked(self.webhook.feishu_sign_enabled)
-        self.feishu_sign_secret_edit.setText(self.webhook.feishu_sign_secret)
-        self.feishu_sign_secret_edit.setEnabled(self.webhook.feishu_sign_enabled)
+
+        # 加载安全配置
+        if self.webhook.dingtalk_sign_enabled:
+            self.security_type_combo.setCurrentIndex(1)  # 钉钉安全
+            self.security_secret_edit.setText(self.webhook.dingtalk_sign_secret)
+        elif self.webhook.feishu_sign_enabled:
+            self.security_type_combo.setCurrentIndex(2)  # 飞书安全
+            self.security_secret_edit.setText(self.webhook.feishu_sign_secret)
+        else:
+            self.security_type_combo.setCurrentIndex(0)  # 无
     
     def _show_variables_help(self):
         """显示变量帮助"""
@@ -434,12 +505,24 @@ class WebhookConfigDialog(QDialog):
         self.webhook.headers = headers
         self.webhook.body_template = self.body_edit.toPlainText()
         self.webhook.enabled = self.enabled_check.isChecked()
-        # 保存钉钉加签配置
-        self.webhook.dingtalk_sign_enabled = self.dingtalk_sign_check.isChecked()
-        self.webhook.dingtalk_sign_secret = self.dingtalk_sign_secret_edit.text().strip()
-        # 保存飞书签名配置
-        self.webhook.feishu_sign_enabled = self.feishu_sign_check.isChecked()
-        self.webhook.feishu_sign_secret = self.feishu_sign_secret_edit.text().strip()
+
+        # 保存安全配置
+        security_type = self.security_type_combo.currentIndex()
+        if security_type == 1:  # 钉钉安全
+            self.webhook.dingtalk_sign_enabled = True
+            self.webhook.dingtalk_sign_secret = self.security_secret_edit.text().strip()
+            self.webhook.feishu_sign_enabled = False
+            self.webhook.feishu_sign_secret = ""
+        elif security_type == 2:  # 飞书安全
+            self.webhook.feishu_sign_enabled = True
+            self.webhook.feishu_sign_secret = self.security_secret_edit.text().strip()
+            self.webhook.dingtalk_sign_enabled = False
+            self.webhook.dingtalk_sign_secret = ""
+        else:  # 无
+            self.webhook.dingtalk_sign_enabled = False
+            self.webhook.dingtalk_sign_secret = ""
+            self.webhook.feishu_sign_enabled = False
+            self.webhook.feishu_sign_secret = ""
 
         self.accept()
     

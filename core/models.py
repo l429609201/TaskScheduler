@@ -170,8 +170,8 @@ class SyncConfig:
     conflict_resolution: str = "newer"
     # 失败后是否继续
     continue_on_error: bool = True
-    # 最大并发传输数
-    max_concurrent: int = 4
+    # 最大并发传输数（默认 2，提高稳定性）
+    max_concurrent: int = 2
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -333,7 +333,9 @@ class Task:
     cron_expression: str = "0 0 * * * *"
     # 是否启用
     enabled: bool = True
-    # Webhook 配置列表
+    # Webhook ID 列表（引用全局配置）
+    webhook_ids: List[str] = field(default_factory=list)
+    # 兼容旧版：完整的 Webhook 配置列表（已废弃，仅用于迁移）
     webhooks: List[WebhookConfig] = field(default_factory=list)
     # 输出解析器列表
     output_parsers: List[OutputParser] = field(default_factory=list)
@@ -350,7 +352,10 @@ class Task:
         data = asdict(self)
         data['task_type'] = self.task_type.value
         data['status'] = self.status.value
-        data['webhooks'] = [w.to_dict() if isinstance(w, WebhookConfig) else w for w in self.webhooks]
+        # 只保存 webhook_ids，不再保存完整的 webhooks
+        data['webhook_ids'] = self.webhook_ids
+        # 清空旧的 webhooks 字段（迁移后不再需要）
+        data['webhooks'] = []
         data['output_parsers'] = [p.to_dict() if isinstance(p, OutputParser) else p for p in self.output_parsers]
         if self.sync_config:
             data['sync_config'] = self.sync_config.to_dict()
@@ -361,7 +366,22 @@ class Task:
         data = data.copy()
         data['task_type'] = TaskType(data.get('task_type', 'command'))
         data['status'] = TaskStatus(data.get('status', 'pending'))
-        data['webhooks'] = [WebhookConfig.from_dict(w) if isinstance(w, dict) else w for w in data.get('webhooks', [])]
+
+        # 兼容旧数据：如果有 webhooks 但没有 webhook_ids，进行迁移
+        old_webhooks = data.get('webhooks', [])
+        webhook_ids = data.get('webhook_ids', [])
+
+        if old_webhooks and not webhook_ids:
+            # 从旧的 webhooks 中提取 ID
+            for w in old_webhooks:
+                if isinstance(w, dict) and 'id' in w:
+                    webhook_ids.append(w['id'])
+                elif isinstance(w, WebhookConfig):
+                    webhook_ids.append(w.id)
+
+        data['webhook_ids'] = webhook_ids
+        data['webhooks'] = []  # 清空旧字段
+
         data['output_parsers'] = [OutputParser.from_dict(p) if isinstance(p, dict) else p for p in data.get('output_parsers', [])]
         if data.get('sync_config'):
             data['sync_config'] = SyncConfig.from_dict(data['sync_config'])
@@ -374,6 +394,31 @@ class Task:
             TaskType.SYNC: "同步任务"
         }
         return type_names.get(self.task_type, "未知")
+
+    def get_webhooks(self, webhook_storage: 'WebhookStorage') -> List[WebhookConfig]:
+        """
+        根据 webhook_ids 从全局配置中获取实际的 Webhook 配置
+
+        Args:
+            webhook_storage: Webhook 存储管理器
+
+        Returns:
+            List[WebhookConfig]: 实际的 Webhook 配置列表
+        """
+        if not self.webhook_ids:
+            return []
+
+        # 加载所有全局 webhook
+        all_webhooks = webhook_storage.load_webhooks()
+        webhook_map = {w.id: w for w in all_webhooks}
+
+        # 根据 ID 获取配置
+        result = []
+        for wid in self.webhook_ids:
+            if wid in webhook_map:
+                result.append(webhook_map[wid])
+
+        return result
 
 
 class TaskStorage:

@@ -39,29 +39,56 @@ class ExecutionThread(QThread):
         """执行任务 - 根据任务类型选择执行方式"""
         from core.models import TaskType
         from core.process_tracker import get_process_tracker
-        self._tracker = get_process_tracker()
+        import logging
+
+        logger = logging.getLogger(__name__)
+        logger.info(f"[ExecutionThread] 开始执行任务: {self.task.name} (ID: {self.task.id})")
 
         start_time = datetime.now()
+        exit_code = -1
 
-        # 如果需要，先终止上次的实例
-        if self.kill_previous or getattr(self.task, 'kill_previous', False):
-            if self._tracker.is_task_running(self.task.id):
-                self.output_received.emit("检测到上次执行的实例仍在运行，正在终止...\n", 'info')
-                self._tracker.kill_task_processes(self.task.id)
-                self.output_received.emit("上次实例已终止\n", 'info')
+        try:
+            self._tracker = get_process_tracker()
+            logger.info(f"[ExecutionThread] 获取进程追踪器成功")
 
-        # 根据任务类型执行
-        if self.task.task_type == TaskType.SYNC:
-            exit_code = self._run_sync_task()
-        else:
-            exit_code = self._run_command_task()
+            # 如果需要，先终止上次的实例
+            if self.kill_previous or getattr(self.task, 'kill_previous', False):
+                logger.info(f"[ExecutionThread] 检查是否需要终止上次实例")
+                if self._tracker.is_task_running(self.task.id):
+                    self.output_received.emit("检测到上次执行的实例仍在运行，正在终止...\n", 'info')
+                    self._tracker.kill_task_processes(self.task.id)
+                    self.output_received.emit("上次实例已终止\n", 'info')
+
+            # 根据任务类型执行
+            logger.info(f"[ExecutionThread] 任务类型: {self.task.task_type}")
+            if self.task.task_type == TaskType.SYNC:
+                logger.info(f"[ExecutionThread] 执行同步任务")
+                exit_code = self._run_sync_task()
+            else:
+                logger.info(f"[ExecutionThread] 执行命令任务")
+                exit_code = self._run_command_task()
+
+            logger.info(f"[ExecutionThread] 任务执行完成，退出码: {exit_code}")
+
+        except Exception as e:
+            import traceback
+            error_msg = f"\n任务执行异常: {e}\n"
+            tb_msg = traceback.format_exc()
+            logger.error(f"[ExecutionThread] {error_msg}")
+            logger.error(f"[ExecutionThread] {tb_msg}")
+            self.output_received.emit(error_msg, 'stderr')
+            self.output_received.emit(tb_msg, 'stderr')
+            exit_code = -1
 
         end_time = datetime.now()
         duration = (end_time - start_time).total_seconds()
+        logger.info(f"[ExecutionThread] 发送完成信号，退出码: {exit_code}, 耗时: {duration}秒")
         self.execution_finished.emit(exit_code, duration)
 
     def _run_command_task(self):
         """执行命令任务"""
+        exit_code = -1
+
         # 设置工作目录
         working_dir = self.task.working_dir
         if working_dir and not os.path.isabs(working_dir):
@@ -73,6 +100,11 @@ class ExecutionThread(QThread):
         self.output_received.emit(f"工作目录: {working_dir}\n", 'info')
         self.output_received.emit(f"命令: {self.task.command}\n", 'info')
         self.output_received.emit("=" * 50 + "\n\n", 'info')
+
+        # 检查命令是否为空
+        if not self.task.command or not self.task.command.strip():
+            self.output_received.emit("错误: 命令为空\n", 'stderr')
+            return 1
 
         try:
             # 设置环境变量
@@ -102,7 +134,8 @@ class ExecutionThread(QThread):
                 )
 
             # 注册到进程追踪器
-            self._tracker.register_task(self.task.id, self.process.pid)
+            if self._tracker:
+                self._tracker.register_task(self.task.id, self.process.pid)
 
             # 实时读取输出
             import threading
@@ -175,12 +208,6 @@ class ExecutionThread(QThread):
                 thread_count=self.task.sync_config.max_concurrent or 4
             )
 
-            # 设置进度回调
-            def on_progress(msg, current, total):
-                self.output_received.emit(f"[{current}/{total}] {msg}\n", 'info')
-
-            self._sync_engine.set_progress_callback(on_progress)
-
             # 执行同步流程
             success, msg = self._sync_engine.connect()
             if not success:
@@ -190,18 +217,44 @@ class ExecutionThread(QThread):
             # 比较文件
             self.output_received.emit("正在比较文件...\n", 'info')
             sync_items = self._sync_engine.compare()
+
+            # 先输出所有文件列表（包括不需要同步的），让用户看到检查了哪些文件
+            self.output_received.emit("===FILE_LIST_START===\n", 'info')
+            for item in sync_items:
+                action_name = self._get_action_name(item.action)
+                self.output_received.emit(f"FILE:{action_name}:{item.relative_path}\n", 'info')
+            self.output_received.emit("===FILE_LIST_END===\n", 'info')
+
+            # 筛选需要同步的文件
             items_to_process = [
                 item for item in sync_items
                 if item.action.value not in ('equal', 'skip', 'conflict')
             ]
 
             total_files = len(items_to_process)
-            self.output_received.emit(f"发现 {total_files} 个文件需要同步\n", 'info')
+            total_checked = len(sync_items)
+
+            self.output_received.emit(f"\n检查了 {total_checked} 个文件，发现 {total_files} 个文件需要同步\n", 'info')
 
             if total_files == 0:
                 self._sync_engine.disconnect()
                 self.output_received.emit("\n所有文件已是最新，无需同步\n", 'info')
                 return 0
+
+            # 设置进度回调
+            def on_progress(msg, current, total):
+                # 包含传输字节数
+                transferred = self._sync_engine._transferred_bytes if self._sync_engine else 0
+                self.output_received.emit(f"[{current}/{total}] {msg} BYTES:{transferred}\n", 'info')
+
+            self._sync_engine.set_progress_callback(on_progress)
+
+            # 设置文件完成回调
+            def on_file_completed(file_path, action, success, bytes_transferred):
+                status = "SUCCESS" if success else "FAILED"
+                self.output_received.emit(f"DONE:{status}:{action}:{file_path}:{bytes_transferred}\n", 'info')
+
+            self._sync_engine.set_file_completed_callback(on_file_completed)
 
             # 执行同步
             result = self._sync_engine.execute(sync_items)
@@ -227,17 +280,75 @@ class ExecutionThread(QThread):
             self.output_received.emit(traceback.format_exc(), 'stderr')
             return 1
 
+    def _get_action_name(self, action):
+        """获取操作名称"""
+        from core.sync_engine import FileAction
+        action_names = {
+            FileAction.COPY_TO_TARGET: "复制",
+            FileAction.COPY_TO_SOURCE: "复制(反向)",
+            FileAction.UPDATE_TARGET: "更新",
+            FileAction.UPDATE_SOURCE: "更新(反向)",
+            FileAction.DELETE_TARGET: "删除",
+            FileAction.DELETE_SOURCE: "删除(反向)",
+            FileAction.EQUAL: "无需同步",
+            FileAction.SKIP: "跳过",
+            FileAction.CONFLICT: "冲突",
+        }
+        return action_names.get(action, "同步")
+
     def stop(self):
         """停止执行"""
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"[ExecutionThread.stop] 收到停止请求，任务: {self.task.name}")
+
         self._stop_requested = True
-        # 如果是同步任务，设置取消标志
+
+        # 如果是同步任务，设置取消标志并断开连接
         if self._sync_engine:
-            self._sync_engine.cancel()
-        # 使用进程追踪器终止所有相关进程
-        if self._tracker:
-            self._tracker.kill_task_processes(self.task.id)
-        elif self.process:
-            self.process.terminate()
+            logger.info(f"[ExecutionThread.stop] 正在取消同步引擎...")
+            try:
+                self._sync_engine.cancel()
+                logger.info(f"[ExecutionThread.stop] 已设置取消标志")
+                # 强制断开连接以中断正在进行的传输
+                self._sync_engine.disconnect()
+                logger.info(f"[ExecutionThread.stop] 已断开连接")
+            except Exception as e:
+                logger.error(f"[ExecutionThread.stop] 取消同步引擎失败: {e}")
+        else:
+            logger.warning(f"[ExecutionThread.stop] _sync_engine 为 None")
+
+        # 终止命令进程
+        if self.process:
+            logger.info(f"[ExecutionThread.stop] 正在终止命令进程...")
+            try:
+                # 先尝试优雅终止
+                self.process.terminate()
+                # 给进程一点时间优雅退出
+                try:
+                    self.process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    # 如果还没退出，强制杀死
+                    self.process.kill()
+                    try:
+                        self.process.wait(timeout=1)
+                    except:
+                        pass
+                logger.info(f"[ExecutionThread.stop] 命令进程已终止")
+            except Exception as e:
+                logger.error(f"[ExecutionThread.stop] 终止命令进程失败: {e}")
+
+        # 使用进程追踪器终止所有相关进程（包括子进程）
+        try:
+            if self._tracker:
+                self._tracker.kill_task_processes(self.task.id)
+            else:
+                # 如果 tracker 还没初始化，获取全局实例
+                from core.process_tracker import get_process_tracker
+                tracker = get_process_tracker()
+                tracker.kill_task_processes(self.task.id)
+        except Exception as e:
+            logger.error(f"[ExecutionThread.stop] 进程追踪器终止失败: {e}")
 
 
 class ExecutionDialog(QDialog):
@@ -512,6 +623,10 @@ class ExecutionDialog(QDialog):
 
     def _on_finished(self, exit_code: int, duration: float):
         """执行完成"""
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"========== 任务执行完成: {self.task.name}, 退出代码: {exit_code} ==========")
+
         self.timer.stop()
         self.progress.setRange(0, 1)
         self.progress.setValue(1)
@@ -532,6 +647,9 @@ class ExecutionDialog(QDialog):
 
         # 记录执行日志
         self._save_log(exit_code, duration)
+
+        # 发送 webhook 通知
+        self._send_webhook_notification(exit_code, duration)
 
         self.stop_btn.setEnabled(False)
         self.close_btn.setEnabled(True)
@@ -594,6 +712,85 @@ class ExecutionDialog(QDialog):
             result=result,
             parsed_vars=parsed_vars
         )
+
+    def _send_webhook_notification(self, exit_code: int, duration: float):
+        """发送 Webhook 通知"""
+        import logging
+        logger = logging.getLogger(__name__)
+
+        logger.info(f"[Webhook] 开始处理webhook通知，任务: {self.task.name}, webhook_ids: {self.task.webhook_ids}")
+
+        # 检查任务是否配置了 webhook
+        if not self.task.webhook_ids:
+            logger.info(f"[Webhook] 任务 {self.task.name} 没有配置webhook，跳过通知")
+            return
+
+        from core.models import WebhookStorage, TaskStorage, SettingsStorage, TaskType
+        from core.scheduler import TaskScheduler
+        from core.executor import ExecutionResult
+
+        # 从缓冲区提取 stdout 和 stderr
+        stdout_lines = []
+        stderr_lines = []
+        for text, output_type in self.output_buffer:
+            if output_type == 'stdout' or output_type == 'info':
+                stdout_lines.append(text)
+            elif output_type == 'stderr':
+                stderr_lines.append(text)
+
+        # 创建 ExecutionResult 对象
+        result = ExecutionResult(
+            success=(exit_code == 0),
+            exit_code=exit_code,
+            stdout=''.join(stdout_lines),
+            stderr=''.join(stderr_lines),
+            start_time=self.start_time,
+            end_time=datetime.now(),
+            duration=duration
+        )
+
+        # 获取 webhook 配置
+        webhook_storage = WebhookStorage()
+        webhooks = self.task.get_webhooks(webhook_storage)
+
+        logger.info(f"[Webhook] 从全局配置获取到 {len(webhooks)} 个webhook配置")
+
+        if not webhooks:
+            logger.warning(f"[Webhook] 任务 {self.task.name} 的webhook_ids无法找到对应的webhook配置")
+            return
+
+        for wh in webhooks:
+            logger.info(f"[Webhook] - {wh.name}: {wh.url[:50]}... (enabled={wh.enabled})")
+
+        # 获取调度器并发送通知
+        storage = TaskStorage()
+        settings_storage = SettingsStorage()
+        scheduler = TaskScheduler(storage, settings_storage)
+
+        # 根据任务类型构建通知参数
+        if self.task.task_type == TaskType.SYNC:
+            logger.info(f"[Webhook] 构建同步任务通知参数")
+            params = scheduler._build_sync_notification_params(self.task, result)
+        else:
+            logger.info(f"[Webhook] 构建命令任务通知参数")
+            params = result.to_notification_params(self.task.name)
+
+        # 使用输出解析器提取变量并合并
+        if self.task.output_parsers:
+            from core.output_parser import OutputParserEngine
+            full_output = result.stdout + "\n" + result.stderr
+            parsed_vars = OutputParserEngine.parse_all(full_output, self.task.output_parsers)
+            logger.info(f"[Webhook] 从输出解析器提取到 {len(parsed_vars)} 个变量")
+            params.update(parsed_vars)
+
+        logger.info(f"[Webhook] 准备发送webhook通知，参数: {list(params.keys())}")
+
+        # 异步发送 webhook
+        try:
+            scheduler.notifier.notify_async(webhooks, params)
+            logger.info(f"[Webhook] 已触发异步发送，共 {len(webhooks)} 个webhook")
+        except Exception as e:
+            logger.error(f"[Webhook] 发送webhook失败: {e}", exc_info=True)
 
     def closeEvent(self, event):
         """关闭事件"""

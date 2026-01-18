@@ -32,18 +32,22 @@ class WebhookResult:
 
 class WebhookNotifier:
     """Webhook 通知器"""
-    
+
     def __init__(self, max_workers: int = 5, timeout: int = 30):
         """
         初始化通知器
-        
+
         Args:
             max_workers: 最大并发数
             timeout: 请求超时时间（秒）
         """
         self.max_workers = max_workers
         self.timeout = timeout
-        self._executor = ThreadPoolExecutor(max_workers=max_workers)
+        # 使用两个独立的线程池，避免死锁
+        # _async_executor: 用于 notify_async 的异步调度
+        # _send_executor: 用于实际发送 webhook 请求
+        self._async_executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="webhook_async")
+        self._send_executor = ThreadPoolExecutor(max_workers=max_workers * 2, thread_name_prefix="webhook_send")
     
     def _replace_variables(self, template: str, params: Dict[str, Any]) -> str:
         """
@@ -191,48 +195,52 @@ class WebhookNotifier:
     def notify(self, webhooks: List[WebhookConfig], params: Dict[str, Any]) -> List[WebhookResult]:
         """
         发送多个 webhook 通知
-        
+
         Args:
             webhooks: webhook 配置列表
             params: 通知参数
-        
+
         Returns:
             List[WebhookResult]: 调用结果列表
         """
         if not webhooks:
             return []
-        
+
         # 过滤启用的 webhooks
         enabled_webhooks = [w for w in webhooks if w.enabled]
         if not enabled_webhooks:
+            logger.debug(f"没有启用的 webhook，跳过发送")
             return []
-        
-        # 并发发送
+
+        logger.info(f"准备发送 {len(enabled_webhooks)} 个 webhook 通知")
+
+        # 使用 _send_executor 并发发送（避免与 notify_async 的线程池冲突）
         futures = []
         for webhook in enabled_webhooks:
-            future = self._executor.submit(self._send_webhook, webhook, params)
-            futures.append(future)
-        
+            future = self._send_executor.submit(self._send_webhook, webhook, params)
+            futures.append((webhook.name, future))
+
         # 收集结果
         results = []
-        for future in futures:
+        for webhook_name, future in futures:
             try:
                 result = future.result(timeout=self.timeout + 5)
                 results.append(result)
             except Exception as e:
+                logger.error(f"Webhook '{webhook_name}' 发送异常: {e}")
                 results.append(WebhookResult(
-                    webhook_name="Unknown",
+                    webhook_name=webhook_name,
                     success=False,
                     error=str(e)
                 ))
-        
+
         return results
-    
-    def notify_async(self, webhooks: List[WebhookConfig], params: Dict[str, Any], 
+
+    def notify_async(self, webhooks: List[WebhookConfig], params: Dict[str, Any],
                      callback: callable = None):
         """
         异步发送 webhook 通知
-        
+
         Args:
             webhooks: webhook 配置列表
             params: 通知参数
@@ -242,10 +250,12 @@ class WebhookNotifier:
             results = self.notify(webhooks, params)
             if callback:
                 callback(results)
-        
-        self._executor.submit(_task)
-    
+
+        # 使用 _async_executor 进行异步调度
+        self._async_executor.submit(_task)
+
     def shutdown(self):
         """关闭执行器"""
-        self._executor.shutdown(wait=False)
+        self._async_executor.shutdown(wait=False)
+        self._send_executor.shutdown(wait=False)
 

@@ -11,18 +11,21 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt
 
-from core.models import Task, WebhookConfig, TaskStatus, OutputParser, ParserStorage
+from core.models import Task, WebhookConfig, TaskStatus, OutputParser, ParserStorage, WebhookStorage
 from .message_box import MsgBox
 
 
 class TaskDialog(QDialog):
     """任务编辑对话框"""
-    
+
     def __init__(self, parent=None, task: Task = None):
         super().__init__(parent)
         self.task = task or Task()
         self.is_edit = task is not None
-        self.webhooks = list(self.task.webhooks) if self.task.webhooks else []
+
+        # Webhook 存储和已选择的 webhook IDs
+        self.webhook_storage = WebhookStorage()
+        self.webhook_ids = list(self.task.webhook_ids) if self.task.webhook_ids else []
         self.output_parsers = list(self.task.output_parsers) if self.task.output_parsers else []
 
         self._init_ui()
@@ -203,20 +206,17 @@ class TaskDialog(QDialog):
         basic_layout.addRow("", self.kill_previous_check)
 
         tabs.addTab(basic_tab, "基本信息")
-        
+
         # Webhook 选项卡
         webhook_tab = QWidget()
         webhook_layout = QVBoxLayout(webhook_tab)
 
         # 提示信息
-        hint_label = QLabel("从全局配置中选择要使用的 Webhook，或为此任务单独添加")
+        hint_label = QLabel("从全局配置中选择要使用的 Webhook（修改全局配置后所有任务自动生效）")
         hint_label.setStyleSheet("color: gray; font-size: 11px; margin-bottom: 5px;")
         webhook_layout.addWidget(hint_label)
 
         # 从全局配置选择
-        from core.models import WebhookStorage
-        self.webhook_storage = WebhookStorage()
-
         select_layout = QHBoxLayout()
         select_layout.addWidget(QLabel("从全局配置添加:"))
 
@@ -241,14 +241,6 @@ class TaskDialog(QDialog):
         # Webhook 按钮
         webhook_btn_layout = QHBoxLayout()
 
-        add_webhook_btn = QPushButton("手动添加")
-        add_webhook_btn.clicked.connect(self._add_webhook)
-        webhook_btn_layout.addWidget(add_webhook_btn)
-
-        edit_webhook_btn = QPushButton("编辑")
-        edit_webhook_btn.clicked.connect(self._edit_webhook)
-        webhook_btn_layout.addWidget(edit_webhook_btn)
-
         del_webhook_btn = QPushButton("移除")
         del_webhook_btn.clicked.connect(self._delete_webhook)
         webhook_btn_layout.addWidget(del_webhook_btn)
@@ -256,7 +248,7 @@ class TaskDialog(QDialog):
         webhook_btn_layout.addStretch()
         webhook_layout.addLayout(webhook_btn_layout)
 
-        tabs.addTab(webhook_tab, f"Webhooks ({len(self.webhooks)})")
+        tabs.addTab(webhook_tab, f"Webhooks ({len(self.webhook_ids)})")
 
         # 输出解析选项卡
         parser_tab = QWidget()
@@ -467,76 +459,77 @@ class TaskDialog(QDialog):
             pass
     
     def _refresh_webhook_table(self):
-        """刷新 Webhook 表格"""
-        self.webhook_table.setRowCount(len(self.webhooks))
-        for row, wh in enumerate(self.webhooks):
-            self.webhook_table.setItem(row, 0, QTableWidgetItem(wh.name))
-            url_display = wh.url[:40] + "..." if len(wh.url) > 40 else wh.url
-            self.webhook_table.setItem(row, 1, QTableWidgetItem(url_display))
-            self.webhook_table.setItem(row, 2, QTableWidgetItem(wh.method))
-            enabled_item = QTableWidgetItem("✓" if wh.enabled else "✗")
-            self.webhook_table.setItem(row, 3, enabled_item)
-        self.tabs.setTabText(1, f"Webhooks ({len(self.webhooks)})")
+        """刷新 Webhook 表格 - 显示已选择的 webhook"""
+        # 确保全局 webhooks 已加载
+        if not hasattr(self, '_global_webhooks'):
+            self._global_webhooks = self.webhook_storage.load_webhooks()
+
+        self.webhook_table.setRowCount(len(self.webhook_ids))
+        for row, wid in enumerate(self.webhook_ids):
+            wh = self._get_webhook_by_id(wid)
+            if wh:
+                self.webhook_table.setItem(row, 0, QTableWidgetItem(wh.name))
+                url_display = wh.url[:40] + "..." if len(wh.url) > 40 else wh.url
+                self.webhook_table.setItem(row, 1, QTableWidgetItem(url_display))
+                self.webhook_table.setItem(row, 2, QTableWidgetItem(wh.method))
+                enabled_item = QTableWidgetItem("✓" if wh.enabled else "✗")
+                self.webhook_table.setItem(row, 3, enabled_item)
+            else:
+                # webhook 已被删除
+                self.webhook_table.setItem(row, 0, QTableWidgetItem(f"[已删除] {wid[:8]}..."))
+                self.webhook_table.setItem(row, 1, QTableWidgetItem("-"))
+                self.webhook_table.setItem(row, 2, QTableWidgetItem("-"))
+                self.webhook_table.setItem(row, 3, QTableWidgetItem("✗"))
+
+        self.tabs.setTabText(1, f"Webhooks ({len(self.webhook_ids)})")
+
+    def _get_webhook_by_id(self, webhook_id: str):
+        """根据 ID 获取 webhook 配置"""
+        if not hasattr(self, '_global_webhooks'):
+            self._global_webhooks = self.webhook_storage.load_webhooks()
+        for wh in self._global_webhooks:
+            if wh.id == webhook_id:
+                return wh
+        return None
 
     def _refresh_global_webhooks(self):
         """刷新全局 Webhook 下拉列表"""
         self.global_webhook_combo.clear()
-        global_webhooks = self.webhook_storage.load_webhooks()
-        if not global_webhooks:
+        self._global_webhooks = self.webhook_storage.load_webhooks()
+        if not self._global_webhooks:
             self.global_webhook_combo.addItem("(无全局配置，请先在 Webhook 配置页面添加)", None)
         else:
-            for wh in global_webhooks:
+            for wh in self._global_webhooks:
                 self.global_webhook_combo.addItem(f"{wh.name} ({wh.url[:30]}...)", wh)
 
     def _add_from_global(self):
-        """从全局配置添加 Webhook"""
+        """从全局配置添加 Webhook（只保存 ID 引用）"""
         webhook = self.global_webhook_combo.currentData()
         if not webhook:
             MsgBox.warning(self, "提示", "请先在 Webhook 配置页面添加全局配置")
             return
 
         # 检查是否已添加
-        for wh in self.webhooks:
-            if wh.id == webhook.id:
-                MsgBox.warning(self, "提示", f"Webhook '{webhook.name}' 已添加")
-                return
+        if webhook.id in self.webhook_ids:
+            MsgBox.warning(self, "提示", f"Webhook '{webhook.name}' 已添加")
+            return
 
-        # 复制一份添加到任务
-        import copy
-        new_webhook = copy.deepcopy(webhook)
-        self.webhooks.append(new_webhook)
+        # 只保存 ID 引用
+        self.webhook_ids.append(webhook.id)
         self._refresh_webhook_table()
 
-    def _add_webhook(self):
-        """添加 Webhook"""
-        dialog = WebhookDialog(self)
-        if dialog.exec_():
-            webhook = dialog.get_webhook()
-            self.webhooks.append(webhook)
-            self._refresh_webhook_table()
-
-    def _edit_webhook(self):
-        """编辑 Webhook"""
-        row = self.webhook_table.currentRow()
-        if row < 0:
-            MsgBox.warning(self, "提示", "请先选择一个 Webhook")
-            return
-
-        webhook = self.webhooks[row]
-        dialog = WebhookDialog(self, webhook)
-        if dialog.exec_():
-            self.webhooks[row] = dialog.get_webhook()
-            self._refresh_webhook_table()
-
     def _delete_webhook(self):
-        """删除 Webhook"""
+        """从任务中移除 Webhook（不删除全局配置）"""
         row = self.webhook_table.currentRow()
         if row < 0:
             MsgBox.warning(self, "提示", "请先选择一个 Webhook")
             return
 
-        if MsgBox.question(self, "确认删除", f"确定要删除 Webhook '{self.webhooks[row].name}' 吗？"):
-            del self.webhooks[row]
+        wh = self._get_webhook_by_id(self.webhook_ids[row])
+        name = wh.name if wh else self.webhook_ids[row][:8]
+
+        if MsgBox.question(self, "确认移除", f"确定要从此任务中移除 Webhook '{name}' 吗？\n（不会删除全局配置）"):
+            del self.webhook_ids[row]
             self._refresh_webhook_table()
 
     # ==================== 输出解析器方法 ====================
@@ -632,7 +625,7 @@ class TaskDialog(QDialog):
         self.task.enabled = self.enabled_check.isChecked()
         self.task.show_window = self.show_window_check.isChecked()
         self.task.kill_previous = self.kill_previous_check.isChecked()
-        self.task.webhooks = self.webhooks
+        self.task.webhook_ids = self.webhook_ids  # 只保存 ID 引用
         self.task.output_parsers = self.output_parsers
 
         if not self.task.enabled:

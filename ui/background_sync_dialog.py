@@ -10,6 +10,7 @@ from PyQt5.QtWidgets import (
     QGroupBox, QFrame
 )
 from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtGui import QColor
 
 from core.models import Task
 
@@ -23,15 +24,18 @@ class BackgroundSyncProgressDialog(QDialog):
         self.bg_manager = bg_manager
         self.start_time = time.time()
         self._last_output_len = 0
-        
+
         # 进度数据
         self.processed_files = 0
         self.total_files = 0
         self.transferred_bytes = 0
-        self.file_results = []  # [(action, file_path, success), ...]
+
+        # 文件列表：{file_path: (action, row_index, status)}
+        self._file_map = {}
+        self._parsing_file_list = False
 
         self.setWindowTitle(f"同步进度 - {task.name}")
-        self.setMinimumSize(550, 400)
+        self.setMinimumSize(550, 450)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
 
         self._init_ui()
@@ -98,19 +102,14 @@ class BackgroundSyncProgressDialog(QDialog):
         self.result_table.setHorizontalHeaderLabels(["操作", "文件", "状态"])
         self.result_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.result_table.setAlternatingRowColors(True)
-        self.result_table.setMaximumHeight(150)
+        # 不设置最大高度，让表格可以扩展
         result_layout.addWidget(self.result_table)
 
-        layout.addWidget(result_group)
+        layout.addWidget(result_group, 1)  # stretch factor = 1，让表格占据剩余空间
 
         # ===== 按钮 =====
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
-
-        self.stop_btn = QPushButton("停止执行")
-        self.stop_btn.setMinimumWidth(100)
-        self.stop_btn.clicked.connect(self._stop_execution)
-        btn_layout.addWidget(self.stop_btn)
 
         self.close_btn = QPushButton("关闭窗口")
         self.close_btn.setMinimumWidth(100)
@@ -146,6 +145,12 @@ class BackgroundSyncProgressDialog(QDialog):
             self._parse_output(output[self._last_output_len:])
             self._last_output_len = len(output)
 
+        # 更新进度条
+        if self.total_files > 0:
+            self.progress_bar.setRange(0, self.total_files)
+            self.progress_bar.setValue(self.processed_files)
+            self.progress_bar.setFormat(f"%v / %m 文件 (%p%)")
+
         # 更新统计
         self._update_stats()
 
@@ -154,42 +159,104 @@ class BackgroundSyncProgressDialog(QDialog):
             self.update_timer.stop()
             self.status_label.setText("✓ 执行完成")
             self.status_label.setStyleSheet("font-weight: bold; color: #4ec9b0;")
-            self.stop_btn.setEnabled(False)
             if self.total_files > 0:
-                self.progress_bar.setRange(0, self.total_files)
-                self.progress_bar.setValue(self.total_files)
+                self.progress_bar.setValue(self.processed_files)
 
     def _parse_output(self, output_list):
         """解析输出文本，提取进度信息"""
         import re
         for text, output_type in output_list:
-            # 解析 [current/total] 格式的进度
-            match = re.search(r'\[(\d+)/(\d+)\]\s*(.+)', text)
+            text = text.strip()
+
+            # 解析任务开始信息
+            if "开始执行同步任务:" in text:
+                self.current_file_label.setText("任务已开始...")
+                self.status_label.setText("状态: 正在执行")
+                continue
+
+            # 解析正在比较文件
+            if "正在比较文件" in text:
+                self.current_file_label.setText("正在比较文件...")
+                continue
+
+            # 解析文件列表开始标记
+            if "===FILE_LIST_START===" in text:
+                self._parsing_file_list = True
+                continue
+
+            # 解析文件列表结束标记
+            if "===FILE_LIST_END===" in text:
+                self._parsing_file_list = False
+                continue
+
+            # 解析文件列表项: FILE:操作:文件路径
+            if self._parsing_file_list and text.startswith("FILE:"):
+                parts = text.split(":", 2)
+                if len(parts) >= 3:
+                    action = parts[1]
+                    file_path = parts[2]
+                    # 根据操作类型设置初始状态
+                    if action in ["无需同步", "跳过"]:
+                        self._add_file_row(action, file_path, "✓ 已跳过")
+                    elif action == "冲突":
+                        self._add_file_row(action, file_path, "⚠ 冲突")
+                    else:
+                        # 需要同步的文件
+                        self._add_file_row(action, file_path, "等待中")
+                continue
+
+            # 解析文件完成: DONE:SUCCESS/FAILED:操作:文件路径:字节数
+            if text.startswith("DONE:"):
+                parts = text.split(":", 4)
+                if len(parts) >= 4:
+                    status = parts[1]  # SUCCESS or FAILED
+                    action = parts[2]
+                    file_path = parts[3]
+                    # 解析字节数（如果有）
+                    if len(parts) >= 5:
+                        try:
+                            bytes_transferred = int(parts[4])
+                            self.transferred_bytes += bytes_transferred
+                        except:
+                            pass
+                    success = (status == "SUCCESS")
+                    self._update_file_status(file_path, success)
+                    self.processed_files += 1
+                continue
+
+            # 解析 [current/total] 格式的进度，包含 BYTES:xxx
+            match = re.search(r'\[(\d+)/(\d+)\]\s*(.+?)(?:\s+BYTES:(\d+))?$', text)
             if match:
                 current = int(match.group(1))
                 total = int(match.group(2))
                 file_info = match.group(3).strip()
+                bytes_str = match.group(4)
 
-                self.processed_files = current
                 self.total_files = total
                 self.current_file_label.setText(file_info)
+
+                # 更新传输字节数（实时）
+                if bytes_str:
+                    try:
+                        self.transferred_bytes = int(bytes_str)
+                    except:
+                        pass
+
+                # 从 file_info 中提取文件路径，设置为传输中
+                # 格式: "处理: path" 或 "传输: path (xx%)"
+                if file_info.startswith("处理:") or file_info.startswith("传输:"):
+                    # 提取文件路径
+                    path_match = re.match(r'(?:处理|传输):\s*(.+?)(?:\s*\(\d+%\))?$', file_info)
+                    if path_match:
+                        file_path = path_match.group(1).strip()
+                        self._set_file_transferring(file_path)
 
                 # 更新进度条
                 if total > 0:
                     self.progress_bar.setRange(0, total)
                     self.progress_bar.setValue(current)
                     self.progress_bar.setFormat(f"%v / %m 文件 (%p%)")
-
-                # 添加到结果表格
-                action = "同步"
-                if "复制" in file_info or "copy" in file_info.lower():
-                    action = "复制"
-                elif "更新" in file_info or "update" in file_info.lower():
-                    action = "更新"
-                elif "删除" in file_info or "delete" in file_info.lower():
-                    action = "删除"
-
-                self._add_result_row(action, file_info, True)
+                continue
 
             # 解析发现文件数
             if "发现" in text and "文件需要同步" in text:
@@ -200,26 +267,85 @@ class BackgroundSyncProgressDialog(QDialog):
                         self.progress_bar.setRange(0, self.total_files)
                         self.progress_bar.setFormat(f"%v / %m 文件 (%p%)")
 
+            # 解析无需同步
+            if "所有文件已是最新" in text or "无需同步" in text:
+                self.current_file_label.setText("所有文件已是最新，无需同步")
+
             # 解析完成信息
             if "同步完成" in text:
                 self.current_file_label.setText("同步完成！")
 
-    def _add_result_row(self, action: str, file_path: str, success: bool):
-        """添加操作结果行"""
+    def _add_file_row(self, action: str, file_path: str, status: str):
+        """添加文件行到表格"""
+        # 检查是否已存在
+        if file_path in self._file_map:
+            return
+
         row = self.result_table.rowCount()
         self.result_table.insertRow(row)
 
         self.result_table.setItem(row, 0, QTableWidgetItem(action))
         self.result_table.setItem(row, 1, QTableWidgetItem(file_path))
 
-        status_item = QTableWidgetItem("✓ 成功" if success else "✗ 失败")
-        if success:
-            status_item.setForeground(Qt.darkGreen)
-        else:
-            status_item.setForeground(Qt.red)
+        status_item = QTableWidgetItem(status)
+        if status == "等待中":
+            status_item.setForeground(Qt.gray)
+        elif status == "✓ 已跳过":
+            status_item.setForeground(QColor("#888888"))  # 灰色
+        elif status == "⚠ 冲突":
+            status_item.setForeground(QColor("#ff9800"))  # 橙色
         self.result_table.setItem(row, 2, status_item)
 
-        self.result_table.scrollToBottom()
+        # 记录文件位置
+        self._file_map[file_path] = (action, row, status)
+
+        # 只有需要同步的文件才计入 total_files
+        # "无需同步"、"跳过"、"冲突" 不计入需要处理的数量
+        if action not in ["无需同步", "跳过", "冲突"]:
+            # 重新计算需要处理的文件数量
+            self.total_files = len([k for k, v in self._file_map.items()
+                                   if v[0] not in ["无需同步", "跳过", "冲突"]])
+
+    def _set_file_transferring(self, file_path: str):
+        """设置文件为传输中状态"""
+        if file_path not in self._file_map:
+            return
+
+        action, row, current_status = self._file_map[file_path]
+        # 只有等待中的文件才更新为传输中
+        if current_status != "等待中":
+            return
+
+        status_item = self.result_table.item(row, 2)
+        if status_item:
+            status_item.setText("⏳ 传输中...")
+            status_item.setForeground(QColor("#0078d4"))  # 蓝色
+
+        self._file_map[file_path] = (action, row, "传输中")
+
+        # 滚动到当前行
+        self.result_table.scrollToItem(status_item)
+
+    def _update_file_status(self, file_path: str, success: bool):
+        """更新文件状态为完成或失败"""
+        if file_path not in self._file_map:
+            return
+
+        action, row, _ = self._file_map[file_path]
+        status = "✓ 完成" if success else "✗ 失败"
+
+        status_item = self.result_table.item(row, 2)
+        if status_item:
+            status_item.setText(status)
+            if success:
+                status_item.setForeground(Qt.darkGreen)
+            else:
+                status_item.setForeground(Qt.red)
+
+        self._file_map[file_path] = (action, row, status)
+
+        # 滚动到当前行
+        self.result_table.scrollToItem(status_item)
 
     def _update_stats(self):
         """更新统计信息"""
@@ -234,21 +360,32 @@ class BackgroundSyncProgressDialog(QDialog):
         else:
             self.files_label.setText(f"已处理: {self.processed_files} 文件")
 
+        # 传输大小
+        self.transferred_label.setText(f"已传输: {self._format_size(self.transferred_bytes)}")
+
+        # 传输速度
+        if elapsed > 0 and self.transferred_bytes > 0:
+            speed = self.transferred_bytes / elapsed
+            self.speed_label.setText(f"速度: {self._format_size(speed)}/s")
+        else:
+            self.speed_label.setText("速度: -- /s")
+
         # 剩余时间估算
         if self.processed_files > 0 and self.processed_files < self.total_files:
             avg_time = elapsed / self.processed_files
             remaining = avg_time * (self.total_files - self.processed_files)
             self.remaining_label.setText(f"剩余时间: {self._format_time(remaining)}")
 
-    def _stop_execution(self):
-        """停止执行"""
-        from ui.message_box import MsgBox
-
-        if MsgBox.question(self, "确认", "确定要停止同步任务吗？") == MsgBox.Yes:
-            if self.bg_manager:
-                self.bg_manager.stop_task(self.task.id)
-                self.status_label.setText("正在停止...")
-                self.stop_btn.setEnabled(False)
+    def _format_size(self, size: float) -> str:
+        """格式化文件大小"""
+        if size < 1024:
+            return f"{size:.0f} B"
+        elif size < 1024 * 1024:
+            return f"{size / 1024:.1f} KB"
+        elif size < 1024 * 1024 * 1024:
+            return f"{size / (1024 * 1024):.1f} MB"
+        else:
+            return f"{size / (1024 * 1024 * 1024):.2f} GB"
 
     def _format_time(self, seconds: float) -> str:
         """格式化时间"""

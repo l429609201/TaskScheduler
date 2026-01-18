@@ -134,15 +134,33 @@ def setup_exception_hook():
     import traceback
     import logging
 
-    # 配置日志
-    log_file = os.path.join(BASE_DIR, 'error.log')
+    # 配置日志 - 统一使用 logs/server.log
+    # 打包后使用可执行文件所在目录
+    if getattr(sys, 'frozen', False):
+        base_path = os.path.dirname(sys.executable)
+    else:
+        base_path = BASE_DIR
+
+    log_dir = os.path.join(base_path, 'logs')
+    if not os.path.exists(log_dir):
+        try:
+            os.makedirs(log_dir)
+        except Exception as e:
+            print(f"创建日志目录失败: {e}", file=sys.stderr)
+
+    log_file = os.path.join(log_dir, 'server.log')
+
+    # 强制输出日志路径到控制台，方便调试
+    print(f"日志文件路径: {log_file}", file=sys.stderr)
+
     logging.basicConfig(
         level=logging.DEBUG,
-        format='%(asctime)s [%(levelname)s] %(message)s',
+        format='%(asctime)s [%(levelname)s] [%(name)s] %(message)s',
         handlers=[
             logging.FileHandler(log_file, encoding='utf-8'),
             logging.StreamHandler(sys.stderr)
-        ]
+        ],
+        force=True  # 强制重新配置，覆盖之前的设置
     )
 
     def exception_hook(exc_type, exc_value, exc_tb):
@@ -234,71 +252,76 @@ def run_gui():
 
 
 def run_service():
-    """运行服务模式（无界面）"""
-    from service.task_service import TaskSchedulerService
-    
-    service = TaskSchedulerService()
-    service.run()
+    """运行服务模式（无界面）- 直接运行调度器"""
+    import logging
+    import time
+    from core.models import TaskStorage
+    from core.scheduler import TaskScheduler
+
+    # 配置日志
+    log_dir = os.path.join(BASE_DIR, 'logs')
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+
+    log_file = os.path.join(log_dir, 'server.log')
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] [%(name)s] %(message)s',
+        handlers=[
+            logging.FileHandler(log_file, encoding='utf-8'),
+            logging.StreamHandler()
+        ]
+    )
+    logger = logging.getLogger(__name__)
+
+    try:
+        logger.info("=" * 60)
+        logger.info("任务调度器后台模式启动")
+        logger.info(f"BASE_DIR: {BASE_DIR}")
+        logger.info("=" * 60)
+
+        # 初始化调度器
+        storage = TaskStorage(os.path.join(BASE_DIR, 'config', 'tasks.json'))
+        scheduler = TaskScheduler(storage)
+
+        # 加载并启动所有任务
+        scheduler.load_all_tasks()
+        scheduler.start()
+
+        logger.info("调度器已启动，按 Ctrl+C 停止")
+
+        # 保持运行
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("收到停止信号")
+        finally:
+            logger.info("停止调度器...")
+            scheduler.stop()
+            logger.info("调度器已停止")
+
+    except Exception as e:
+        logger.error(f"服务运行失败: {e}", exc_info=True)
+        sys.exit(1)
 
 
 def main():
     """主入口"""
     import argparse
-    
+
     parser = argparse.ArgumentParser(description='任务调度器')
-    parser.add_argument('--service', '-s', action='store_true', 
+    parser.add_argument('--service', '-s', action='store_true',
                         help='以服务模式运行（无界面）')
-    parser.add_argument('--install', action='store_true',
-                        help='安装 Windows 服务')
-    parser.add_argument('--uninstall', action='store_true',
-                        help='卸载 Windows 服务')
-    parser.add_argument('--start', action='store_true',
-                        help='启动 Windows 服务')
-    parser.add_argument('--stop', action='store_true',
-                        help='停止 Windows 服务')
-    parser.add_argument('--status', action='store_true',
-                        help='查询服务状态')
-    
+    parser.add_argument('--background', '-b', action='store_true',
+                        help='后台运行模式（开机启动时使用）')
+
     args = parser.parse_args()
-    
-    if args.install:
-        from service.installer import ServiceInstaller
-        installer = ServiceInstaller()
-        success, msg = installer.install()
-        print(msg)
-        sys.exit(0 if success else 1)
-    
-    elif args.uninstall:
-        from service.installer import ServiceInstaller
-        installer = ServiceInstaller()
-        success, msg = installer.uninstall()
-        print(msg)
-        sys.exit(0 if success else 1)
-    
-    elif args.start:
-        from service.installer import ServiceInstaller
-        installer = ServiceInstaller()
-        success, msg = installer.start()
-        print(msg)
-        sys.exit(0 if success else 1)
-    
-    elif args.stop:
-        from service.installer import ServiceInstaller
-        installer = ServiceInstaller()
-        success, msg = installer.stop()
-        print(msg)
-        sys.exit(0 if success else 1)
-    
-    elif args.status:
-        from service.installer import ServiceInstaller
-        installer = ServiceInstaller()
-        success, msg = installer.status()
-        print(msg)
-        sys.exit(0 if success else 1)
-    
-    elif args.service:
+
+    if args.service or args.background:
+        # 服务模式或后台模式都运行无界面版本
         run_service()
-    
+
     else:
         run_gui()
 

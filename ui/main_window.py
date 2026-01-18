@@ -41,24 +41,73 @@ class BackgroundTaskManager:
 
     def start_task(self, task: Task) -> bool:
         """启动后台任务"""
+        import logging
+        logger = logging.getLogger(__name__)
+
+        logger.info(f"[BackgroundTaskManager] start_task 被调用，任务: {task.name} (ID: {task.id})")
+
         # 如果设置了 kill_previous，先终止上次的实例
         kill_previous = getattr(task, 'kill_previous', False)
-        if not kill_previous and task.id in self._running_tasks:
-            return False  # 任务已在运行且不允许终止
+
+        # 检查任务是否已在运行
+        if task.id in self._running_tasks:
+            thread, _, _, _ = self._running_tasks[task.id]
+            if thread.isRunning():
+                if not kill_previous:
+                    logger.info(f"[BackgroundTaskManager] 任务 {task.name} 已在运行，跳过启动")
+                    return False  # 任务已在运行且不允许终止
+                else:
+                    logger.info(f"[BackgroundTaskManager] 任务 {task.name} 已在运行，正在终止...")
+                    self.stop_task(task.id)
+            else:
+                # 线程已结束，清理旧记录
+                logger.info(f"[BackgroundTaskManager] 清理已完成的任务记录: {task.name}")
+                del self._running_tasks[task.id]
 
         from datetime import datetime
         output_buffer = []
         start_time = datetime.now()
+
+        # 创建新线程
+        logger.info(f"[BackgroundTaskManager] 创建 ExecutionThread，任务类型: {task.task_type}")
         thread = ExecutionThread(task, kill_previous=kill_previous)
-        thread.output_received.connect(lambda text, t: output_buffer.append((text, t)))
-        thread.execution_finished.connect(lambda code, dur: self._on_task_finished(task.id, code, dur))
+
+        # 使用闭包捕获正确的变量
+        task_id = task.id
+        task_name = task.name
+
+        def on_output(text, t):
+            output_buffer.append((text, t))
+            logger.debug(f"[BackgroundTaskManager] 任务 {task_name} 输出: {text[:50]}...")
+
+        def on_finished(code, dur):
+            logger.info(f"[BackgroundTaskManager] 任务 {task_name} 完成，退出码: {code}, 耗时: {dur}秒")
+            self._on_task_finished(task_id, code, dur)
+
+        thread.output_received.connect(on_output)
+        thread.execution_finished.connect(on_finished)
+
+        logger.info(f"[BackgroundTaskManager] 启动线程: {task.name}")
         thread.start()
 
+        # 检查线程是否真的启动了
+        import time
+        time.sleep(0.1)  # 等待一小段时间
+        if thread.isRunning():
+            logger.info(f"[BackgroundTaskManager] 线程已启动并正在运行: {task.name}")
+        else:
+            logger.warning(f"[BackgroundTaskManager] 线程可能没有正确启动: {task.name}")
+
         self._running_tasks[task.id] = (thread, output_buffer, task, start_time)
+        logger.info(f"[BackgroundTaskManager] 任务已添加到运行列表，当前运行任务数: {len(self._running_tasks)}")
         return True
 
     def _on_task_finished(self, task_id: str, exit_code: int, duration: float):
         """任务完成回调"""
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"[BackgroundTaskManager._on_task_finished] 任务完成: {task_id}, 退出码: {exit_code}")
+
         if task_id in self._running_tasks:
             _thread, buffer, task, start_time = self._running_tasks[task_id]
             # 添加完成信息到缓冲区
@@ -74,6 +123,9 @@ class BackgroundTaskManager:
             if self._task_logger:
                 self._save_log(task, buffer, exit_code, duration, start_time)
 
+            # 发送 webhook 通知
+            self._send_webhook_notification(task, buffer, exit_code, duration, start_time)
+
     def _update_task_status(self, task: Task, exit_code: int):
         """更新任务状态"""
         from datetime import datetime
@@ -84,6 +136,79 @@ class BackgroundTaskManager:
         task.last_result = f"Exit code: {exit_code}"
         self._storage.update_task(task)
 
+    def _send_webhook_notification(self, task: Task, buffer: list, exit_code: int, duration: float, start_time):
+        """发送 webhook 通知"""
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"[BackgroundTaskManager._send_webhook_notification] 开始处理webhook，任务: {task.name}")
+
+        # 检查任务是否配置了 webhook
+        if not task.webhook_ids:
+            logger.info(f"[BackgroundTaskManager._send_webhook_notification] 任务没有配置webhook，跳过")
+            return
+
+        from datetime import datetime
+        from core.executor import ExecutionResult
+        from core.models import TaskType, WebhookStorage, TaskStorage, SettingsStorage
+
+        # 从缓冲区提取 stdout 和 stderr
+        stdout_lines = []
+        stderr_lines = []
+        for text, output_type in buffer:
+            if output_type == 'stdout' or output_type == 'info':
+                stdout_lines.append(text)
+            elif output_type == 'stderr':
+                stderr_lines.append(text)
+
+        # 创建 ExecutionResult 对象
+        result = ExecutionResult(
+            success=(exit_code == 0),
+            exit_code=exit_code,
+            stdout=''.join(stdout_lines),
+            stderr=''.join(stderr_lines),
+            start_time=start_time,
+            end_time=datetime.now(),
+            duration=duration
+        )
+
+        # 获取 webhook 配置
+        webhook_storage = WebhookStorage()
+        webhooks = task.get_webhooks(webhook_storage)
+
+        logger.info(f"[BackgroundTaskManager._send_webhook_notification] 获取到 {len(webhooks)} 个webhook配置")
+
+        if not webhooks:
+            logger.warning(f"[BackgroundTaskManager._send_webhook_notification] 无法找到webhook配置")
+            return
+
+        # 从调度器获取 notifier
+        from core.scheduler import TaskScheduler
+        storage = TaskStorage()
+        settings_storage = SettingsStorage()
+        scheduler = TaskScheduler(storage, settings_storage, webhook_storage)
+
+        # 根据任务类型构建通知参数
+        if task.task_type == TaskType.SYNC:
+            params = scheduler._build_sync_notification_params(task, result)
+        else:
+            params = result.to_notification_params(task.name)
+
+        # 使用输出解析器提取变量并合并
+        if task.output_parsers:
+            from core.output_parser import OutputParserEngine
+            full_output = result.stdout + "\n" + result.stderr
+            parsed_vars = OutputParserEngine.parse_all(full_output, task.output_parsers)
+            params.update(parsed_vars)
+
+        logger.info(f"[BackgroundTaskManager._send_webhook_notification] 准备发送webhook，参数: {list(params.keys())}")
+
+        # 异步发送 webhook
+        try:
+            scheduler.notifier.notify_async(webhooks, params)
+            logger.info(f"[BackgroundTaskManager._send_webhook_notification] 已触发异步发送，共 {len(webhooks)} 个webhook")
+        except Exception as e:
+            logger.error(f"[BackgroundTaskManager._send_webhook_notification] 发送webhook失败: {e}", exc_info=True)
+
     def _save_log(self, task: Task, buffer: list, exit_code: int, duration: float, start_time):
         """保存执行日志"""
         from datetime import datetime
@@ -91,10 +216,11 @@ class BackgroundTaskManager:
         from core.models import TaskType
 
         # 从缓冲区提取 stdout 和 stderr
+        # info 类型的输出也归入 stdout（包含任务开始、进度等信息）
         stdout_lines = []
         stderr_lines = []
         for text, output_type in buffer:
-            if output_type == 'stdout':
+            if output_type == 'stdout' or output_type == 'info':
                 stdout_lines.append(text)
             elif output_type == 'stderr':
                 stderr_lines.append(text)
@@ -120,25 +246,28 @@ class BackgroundTaskManager:
             parsed_vars = OutputParserEngine.parse_all(full_output, task.output_parsers)
 
         # 根据任务类型记录日志
-        if task.task_type == TaskType.SYNC:
-            # 同步任务
-            self._task_logger.log_sync_execution(
-                task_id=task.id,
-                task_name=task.name,
-                sync_config=task.sync_config,
-                result=result,
-                parsed_vars=parsed_vars
-            )
-        else:
-            # 命令任务
-            self._task_logger.log_execution(
-                task_id=task.id,
-                task_name=task.name,
-                command=task.command,
-                working_dir=task.working_dir,
-                result=result,
-                parsed_vars=parsed_vars
-            )
+        try:
+            if task.task_type == TaskType.SYNC:
+                # 同步任务
+                self._task_logger.log_sync_execution(
+                    task_id=task.id,
+                    task_name=task.name,
+                    sync_config=task.sync_config,
+                    result=result,
+                    parsed_vars=parsed_vars
+                )
+            else:
+                # 命令任务
+                self._task_logger.log_execution(
+                    task_id=task.id,
+                    task_name=task.name,
+                    command=task.command,
+                    working_dir=task.working_dir,
+                    result=result,
+                    parsed_vars=parsed_vars
+                )
+        except Exception as e:
+            print(f"保存日志失败: {e}")
 
     def is_running(self, task_id: str) -> bool:
         """检查任务是否在运行"""
@@ -155,12 +284,25 @@ class BackgroundTaskManager:
         return []
 
     def stop_task(self, task_id: str) -> bool:
-        """停止任务"""
+        """停止任务（非阻塞）"""
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"[BackgroundTaskManager.stop_task] 收到停止请求，任务ID: {task_id}")
+
         if task_id in self._running_tasks:
-            thread, _, _, _ = self._running_tasks[task_id]
+            thread, buffer, task, start_time = self._running_tasks[task_id]
             if thread.isRunning():
+                logger.info(f"[BackgroundTaskManager.stop_task] 线程正在运行，调用 thread.stop()")
+                # 添加停止信息到缓冲区
+                buffer.append(("\n正在停止任务...\n", 'info'))
+                # 调用线程的 stop 方法（非阻塞）
                 thread.stop()
+                logger.info(f"[BackgroundTaskManager.stop_task] thread.stop() 已调用")
                 return True
+            else:
+                logger.warning(f"[BackgroundTaskManager.stop_task] 线程已不在运行")
+        else:
+            logger.warning(f"[BackgroundTaskManager.stop_task] 任务ID不在运行列表中")
         return False
 
     def clear_task(self, task_id: str):
@@ -187,7 +329,7 @@ class MainWindow(QMainWindow):
         self.parser_storage = ParserStorage()
         self.settings_storage = SettingsStorage()
         self.settings = self.settings_storage.load()
-        self.scheduler = TaskScheduler(self.storage, self.settings_storage)
+        self.scheduler = TaskScheduler(self.storage, self.settings_storage, self.webhook_storage)
 
         # 后台任务管理器 - 共享调度器的日志记录器和存储
         self.bg_task_manager = BackgroundTaskManager()
@@ -196,6 +338,10 @@ class MainWindow(QMainWindow):
 
         # 当前页面索引
         self.current_page = 0  # 0: 任务, 1: Webhook, 2: 解析器
+
+        # 任务进度跟踪 - 用于在主窗口显示进度条
+        self._task_progress = {}  # {task_id: {'percent': 0-100, 'text': 'status text'}}
+        self._task_progress_widgets = {}  # {task_id: TaskProgressWidget}
 
         # 设置回调
         self.scheduler.set_callbacks(
@@ -267,10 +413,6 @@ class MainWindow(QMainWindow):
         settings_action = QAction("设置", self)
         settings_action.triggered.connect(self._open_settings)
         self.toolbar.addAction(settings_action)
-
-        service_action = QAction("安装服务", self)
-        service_action.triggered.connect(self._install_service)
-        self.toolbar.addAction(service_action)
 
         # 分页标签
         self.tab_widget = QTabWidget()
@@ -453,6 +595,37 @@ class MainWindow(QMainWindow):
             # 恢复定时刷新
             if timer_was_active:
                 self.refresh_timer.start(10000)
+
+    def update_task_progress(self, task_id: str, percent: int, text: str):
+        """更新单个任务的进度（不重新加载整个表格）"""
+        # 更新进度信息
+        self._task_progress[task_id] = {
+            'percent': percent,
+            'text': text
+        }
+
+        # 查找任务在表格中的行号
+        row = -1
+        for i in range(self.table.rowCount()):
+            item = self.table.item(i, 0)  # 名称列
+            if item and item.data(Qt.UserRole) == task_id:
+                row = i
+                break
+
+        if row == -1:
+            return  # 任务不在表格中
+
+        # 检查是否已有进度 widget
+        if task_id in self._task_progress_widgets:
+            # 更新现有 widget
+            self._task_progress_widgets[task_id].set_progress(percent, text)
+        else:
+            # 创建新的进度 widget
+            from ui.progress_widget import TaskProgressWidget
+            progress_widget = TaskProgressWidget()
+            progress_widget.set_progress(percent, text)
+            self._task_progress_widgets[task_id] = progress_widget
+            self.table.setCellWidget(row, 1, progress_widget)
     
     def _set_table_row(self, row: int, task: Task):
         """设置表格行"""
@@ -460,25 +633,47 @@ class MainWindow(QMainWindow):
         name_item = QTableWidgetItem(task.name)
         name_item.setData(Qt.UserRole, task.id)
         self.table.setItem(row, 0, name_item)
-        
-        # 状态 - 汉化显示
-        status_text_map = {
-            TaskStatus.PENDING: "等待中",
-            TaskStatus.RUNNING: "执行中",
-            TaskStatus.SUCCESS: "成功",
-            TaskStatus.FAILED: "失败",
-            TaskStatus.DISABLED: "已禁用"
-        }
-        status_item = QTableWidgetItem(status_text_map.get(task.status, task.status.value))
-        status_colors = {
-            TaskStatus.PENDING: QColor(100, 100, 100),
-            TaskStatus.RUNNING: QColor(0, 120, 215),
-            TaskStatus.SUCCESS: QColor(0, 150, 0),
-            TaskStatus.FAILED: QColor(200, 0, 0),
-            TaskStatus.DISABLED: QColor(150, 150, 150)
-        }
-        status_item.setForeground(status_colors.get(task.status, QColor(0, 0, 0)))
-        self.table.setItem(row, 1, status_item)
+
+        # 状态 - 根据任务状态显示不同内容
+        from ui.progress_widget import TaskProgressWidget
+
+        # 检查是否有进度信息（同步任务）
+        if hasattr(self, '_task_progress') and task.id in self._task_progress:
+            # 显示进度条
+            progress_info = self._task_progress[task.id]
+
+            # 复用或创建 progress_widget
+            if task.id in self._task_progress_widgets:
+                progress_widget = self._task_progress_widgets[task.id]
+            else:
+                progress_widget = TaskProgressWidget()
+                self._task_progress_widgets[task.id] = progress_widget
+                self.table.setCellWidget(row, 1, progress_widget)
+
+            progress_widget.set_progress(progress_info['percent'], progress_info['text'])
+        else:
+            # 清除进度 widget（如果有）
+            if task.id in self._task_progress_widgets:
+                del self._task_progress_widgets[task.id]
+
+            # 显示状态文字
+            status_text_map = {
+                TaskStatus.PENDING: "等待中",
+                TaskStatus.RUNNING: "执行中",
+                TaskStatus.SUCCESS: "成功",
+                TaskStatus.FAILED: "失败",
+                TaskStatus.DISABLED: "已禁用"
+            }
+            status_item = QTableWidgetItem(status_text_map.get(task.status, task.status.value))
+            status_colors = {
+                TaskStatus.PENDING: QColor(100, 100, 100),
+                TaskStatus.RUNNING: QColor(0, 120, 215),
+                TaskStatus.SUCCESS: QColor(0, 150, 0),
+                TaskStatus.FAILED: QColor(200, 0, 0),
+                TaskStatus.DISABLED: QColor(150, 150, 150)
+            }
+            status_item.setForeground(status_colors.get(task.status, QColor(0, 0, 0)))
+            self.table.setItem(row, 1, status_item)
         
         # Cron
         self.table.setItem(row, 2, QTableWidgetItem(task.cron_expression))
@@ -494,9 +689,16 @@ class MainWindow(QMainWindow):
         next_run = self.scheduler.get_next_run_time(task.id)
         next_run_str = next_run.strftime("%Y-%m-%d %H:%M:%S") if next_run else "-"
         self.table.setItem(row, 4, QTableWidgetItem(next_run_str))
-        
-        # Webhooks 数量
-        webhook_count = len([w for w in task.webhooks if w.enabled])
+
+        # Webhooks 数量 - 显示已启用的 webhook 数量
+        import logging
+        logger = logging.getLogger(__name__)
+
+        webhooks = task.get_webhooks(self.webhook_storage)
+        webhook_count = len([w for w in webhooks if w.enabled])
+
+        logger.debug(f"任务 '{task.name}': webhook_ids={task.webhook_ids}, 获取到 {len(webhooks)} 个webhook配置, 启用的有 {webhook_count} 个")
+
         self.table.setItem(row, 5, QTableWidgetItem(str(webhook_count)))
         
         # 操作按钮
@@ -608,16 +810,24 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"任务 '{task.name}' 已删除")
 
     def _run_task_with_window(self, task: Task):
-        """有窗口执行任务（显示实时输出）"""
+        """有窗口执行任务（显示实时输出）
+
+        统一使用后台任务管理器执行，同时打开输出窗口显示进度
+        """
         from core.models import TaskType
 
-        if task.task_type == TaskType.SYNC:
-            # 同步任务：使用同步进度对话框
-            self._run_sync_task_with_window(task)
-        else:
-            # 命令任务：使用原有的执行对话框
-            dialog = ExecutionDialog(self, task, task_logger=self.scheduler.task_logger)
-            dialog.exec_()
+        # 检查任务是否已在运行
+        if self.bg_task_manager.is_running(task.id):
+            # 任务已在运行，直接打开输出窗口
+            self._show_background_output(task)
+            return
+
+        # 启动后台任务
+        self.bg_task_manager.start_task(task)
+        self.statusBar().showMessage(f"任务 '{task.name}' 已启动")
+
+        # 打开输出窗口
+        self._show_background_output(task)
         self._load_tasks()
 
     def _run_sync_task_with_window(self, task: Task):
@@ -630,7 +840,7 @@ class MainWindow(QMainWindow):
             return
 
         # 创建同步引擎
-        engine = SyncEngine(task.sync_config, thread_count=task.sync_config.max_concurrent or 4)
+        engine = SyncEngine(task.sync_config, thread_count=task.sync_config.max_concurrent or 2)
 
         # 连接
         success, msg = engine.connect()
@@ -638,17 +848,63 @@ class MainWindow(QMainWindow):
             MsgBox.critical(self, "连接失败", msg)
             return
 
-        # 比较文件
+        # 比较文件 - 获取所有比较结果
         sync_items = engine.compare()
+
+        # 过滤出需要处理的文件
         items_to_process = [
             item for item in sync_items
             if item.action.value not in ('equal', 'skip', 'conflict')
         ]
 
         total_files = len(items_to_process)
+
+        # 即使没有需要同步的文件，也显示比较结果
         if total_files == 0:
+            # 显示比较结果对话框
+            from core.sync_engine import SyncResult
+            from datetime import datetime
+
+            # 创建一个空的同步结果
+            result = SyncResult()
+            result.start_time = datetime.now()
+            result.end_time = datetime.now()
+            result.success = True
+            result.skipped_files = len(sync_items)
+
+            # 记录所有比较过的文件
+            for item in sync_items:
+                result.details.append(('已是最新', item.relative_path, True, 0))
+
             engine.disconnect()
-            MsgBox.information(self, "同步完成", "没有需要同步的文件")
+
+            # 显示结果
+            MsgBox.information(self, "同步完成",
+                f"所有文件已是最新，无需同步。\n\n"
+                f"比较文件数: {len(sync_items)}")
+
+            # 发送 webhook 通知（即使没有需要同步的文件）
+            webhooks = task.get_webhooks(self.webhook_storage)
+            if webhooks:
+                from core.executor import ExecutionResult
+                exec_result = ExecutionResult(
+                    success=True,
+                    exit_code=0,
+                    stdout=f"所有文件已是最新，无需同步。比较文件数: {len(sync_items)}",
+                    stderr="",
+                    start_time=result.start_time,
+                    end_time=result.end_time,
+                    duration=0
+                )
+                params = self.scheduler._build_sync_notification_params(task, exec_result)
+                self.scheduler.notifier.notify_async(webhooks, params)
+
+            # 更新任务状态
+            task.status = TaskStatus.SUCCESS
+            task.last_run = datetime.now().isoformat()
+            task.last_result = f"无需同步 (比较: {len(sync_items)} 个文件)"
+            self.storage.update_task(task)
+            self._load_tasks()
             return
 
         # 估算总大小
@@ -658,8 +914,8 @@ class MainWindow(QMainWindow):
             for item in items_to_process
         )
 
-        # 创建进度对话框
-        progress_dialog = SyncProgressDialog(engine, total_files, total_bytes, items_to_process, self)
+        # 创建进度对话框 - 传递所有比较过的文件（包括已是最新的）
+        progress_dialog = SyncProgressDialog(engine, total_files, total_bytes, sync_items, self)
 
         # 创建工作线程 - 保存为对话框属性防止被垃圾回收
         # 传递预先比较好的同步项，避免重复比较
@@ -733,7 +989,8 @@ class MainWindow(QMainWindow):
                 )
 
             # 发送 webhook 通知
-            if task.webhooks:
+            webhooks = task.get_webhooks(self.webhook_storage)
+            if webhooks:
                 from core.executor import ExecutionResult
                 duration = (result.end_time - result.start_time).total_seconds() if result.end_time and result.start_time else 0
                 exec_result = ExecutionResult(
@@ -746,7 +1003,7 @@ class MainWindow(QMainWindow):
                     duration=duration
                 )
                 params = self.scheduler._build_sync_notification_params(task, exec_result)
-                self.scheduler.notifier.notify_async(task.webhooks, params)
+                self.scheduler.notifier.notify_async(webhooks, params)
 
         progress_dialog.sync_worker.progress_updated.connect(on_progress)
         progress_dialog.sync_worker.file_completed.connect(on_file_completed)
@@ -1079,28 +1336,21 @@ class MainWindow(QMainWindow):
 
     def _open_settings(self):
         """打开设置对话框"""
-        dialog = SettingsDialog(self, self.settings)
-        if dialog.exec_() and dialog.settings_changed:
-            self.settings = dialog.get_settings()
-            self.settings_storage.save(self.settings)
-            # 更新调度器的日志设置
-            self.scheduler.update_log_settings(
-                self.settings.log_enabled,
-                self.settings.log_dir
-            )
-            self.statusBar().showMessage("设置已保存")
-
-    def _install_service(self):
-        """安装 Windows 服务"""
-        from service.installer import ServiceInstaller
-        installer = ServiceInstaller()
-
-        if MsgBox.question(self, "安装服务", "是否将任务调度器安装为 Windows 服务？\n安装后程序将在后台运行，不会被轻易关闭。"):
-            success, msg = installer.install()
-            if success:
-                MsgBox.information(self, "成功", msg)
-            else:
-                MsgBox.warning(self, "失败", msg)
+        try:
+            dialog = SettingsDialog(self, self.settings)
+            if dialog.exec_() and dialog.settings_changed:
+                self.settings = dialog.get_settings()
+                self.settings_storage.save(self.settings)
+                # 更新调度器的日志设置
+                self.scheduler.update_log_settings(
+                    self.settings.log_enabled,
+                    self.settings.log_dir
+                )
+                self.statusBar().showMessage("设置已保存")
+        except Exception as e:
+            import traceback
+            error_msg = f"打开设置对话框失败:\n{str(e)}\n\n{traceback.format_exc()}"
+            MsgBox.critical(self, "错误", error_msg)
 
     def _tray_activated(self, reason):
         """托盘图标激活"""

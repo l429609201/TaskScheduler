@@ -133,23 +133,25 @@ class BackgroundOutputDialog(QDialog):
             output = self.bg_manager.get_output(self.task.id)
             for text, output_type in output:
                 self._append_output(text, output_type)
+                self._update_status_from_output(text)
             self._last_output_len = len(output)
-    
+
     def _refresh_output(self):
         """刷新输出"""
         if not self.bg_manager:
             return
-        
+
         # 检查任务状态
         is_running = self.bg_manager.is_running(self.task.id)
-        
+
         # 获取新输出
         output = self.bg_manager.get_output(self.task.id)
         if len(output) > self._last_output_len:
             for text, output_type in output[self._last_output_len:]:
                 self._append_output(text, output_type)
+                self._update_status_from_output(text)
             self._last_output_len = len(output)
-        
+
         # 更新状态
         if not is_running:
             self.refresh_timer.stop()
@@ -158,6 +160,17 @@ class BackgroundOutputDialog(QDialog):
             self.status_label.setText("✓ 执行完成")
             self.status_label.setStyleSheet("font-weight: bold; color: #4ec9b0;")
             self.stop_btn.setEnabled(False)
+
+    def _update_status_from_output(self, text: str):
+        """根据输出更新状态显示"""
+        if "开始执行任务:" in text:
+            self.status_label.setText("正在执行...")
+        elif "执行成功" in text:
+            self.status_label.setText("✓ 执行成功")
+            self.status_label.setStyleSheet("font-weight: bold; color: #4ec9b0;")
+        elif "执行失败" in text:
+            self.status_label.setText("✗ 执行失败")
+            self.status_label.setStyleSheet("font-weight: bold; color: #f14c4c;")
     
     def _append_output(self, text: str, output_type: str):
         """追加输出，支持 ANSI 转义码"""

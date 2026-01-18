@@ -10,7 +10,7 @@ from PyQt5.QtWidgets import (
     QGroupBox, QFrame, QSizePolicy
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread
-from PyQt5.QtGui import QFont
+from PyQt5.QtGui import QFont, QColor
 
 
 class SyncWorkerThread(QThread):
@@ -78,8 +78,10 @@ class SyncProgressDialog(QDialog):
         self.current_file = ""
         self._cancelled = False
         self.result = None
+        self._file_map = {}  # {file_path: (action, row, status)}
 
         self._init_ui()
+        self._populate_file_list()  # 预先填充文件列表
         self._start_timer()
 
     def _init_ui(self):
@@ -180,6 +182,50 @@ class SyncProgressDialog(QDialog):
         self.update_timer.timeout.connect(self._update_stats)
         self.update_timer.start(500)  # 每500ms更新一次
 
+    def _populate_file_list(self):
+        """预先填充文件列表 - 显示所有比较过的文件"""
+        if not self.sync_items:
+            return
+
+        from core.sync_engine import FileAction
+        action_names = {
+            FileAction.COPY_TO_TARGET: "复制",
+            FileAction.COPY_TO_SOURCE: "复制(反向)",
+            FileAction.UPDATE_TARGET: "更新",
+            FileAction.UPDATE_SOURCE: "更新(反向)",
+            FileAction.DELETE_TARGET: "删除",
+            FileAction.DELETE_SOURCE: "删除(反向)",
+            FileAction.EQUAL: "已是最新",
+            FileAction.SKIP: "跳过",
+            FileAction.CONFLICT: "冲突",
+        }
+
+        for item in self.sync_items:
+            action_name = action_names.get(item.action, str(item.action))
+            file_path = item.relative_path
+
+            row = self.result_table.rowCount()
+            self.result_table.insertRow(row)
+
+            self.result_table.setItem(row, 0, QTableWidgetItem(action_name))
+            self.result_table.setItem(row, 1, QTableWidgetItem(file_path))
+
+            # 根据操作类型设置初始状态
+            if item.action in (FileAction.EQUAL, FileAction.SKIP):
+                # 无需操作的文件直接显示为完成
+                status_item = QTableWidgetItem("✓ 无需操作")
+                status_item.setForeground(Qt.darkGray)
+            elif item.action == FileAction.CONFLICT:
+                status_item = QTableWidgetItem("⚠ 冲突")
+                status_item.setForeground(QColor(255, 165, 0))  # 橙色
+            else:
+                # 需要操作的文件显示等待中
+                status_item = QTableWidgetItem("等待中")
+                status_item.setForeground(Qt.gray)
+
+            self.result_table.setItem(row, 2, status_item)
+            self._file_map[file_path] = (action_name, row, status_item.text())
+
     def _update_stats(self):
         """更新统计信息"""
         elapsed = time.time() - self.start_time
@@ -218,23 +264,65 @@ class SyncProgressDialog(QDialog):
         self.files_label.setText(f"已处理: {current} / {self.total_files} 文件")
         self.transferred_label.setText(f"已传输: {self._format_size(self.transferred_bytes)}")
 
+        # 从 message 中提取文件路径，设置为传输中
+        import re
+        if message.startswith("处理:") or message.startswith("传输:"):
+            path_match = re.match(r'(?:处理|传输):\s*(.+?)(?:\s*\(\d+%\))?$', message)
+            if path_match:
+                file_path = path_match.group(1).strip()
+                self._set_file_transferring(file_path)
+
+    def _set_file_transferring(self, file_path: str):
+        """设置文件为传输中状态"""
+        if file_path not in self._file_map:
+            return
+
+        action, row, current_status = self._file_map[file_path]
+        if current_status != "等待中":
+            return
+
+        from PyQt5.QtGui import QColor
+        status_item = self.result_table.item(row, 2)
+        if status_item:
+            status_item.setText("⏳ 传输中...")
+            status_item.setForeground(QColor("#0078d4"))
+
+        self._file_map[file_path] = (action, row, "传输中")
+        self.result_table.scrollToItem(status_item)
+
     def add_result_row(self, action: str, file_path: str, success: bool, bytes_transferred: int = 0):
-        """添加操作结果行"""
-        row = self.result_table.rowCount()
-        self.result_table.insertRow(row)
+        """更新文件状态为完成或失败"""
+        # 如果文件已在列表中，更新状态
+        if file_path in self._file_map:
+            _, row, _ = self._file_map[file_path]
+            status = "✓ 完成" if success else "✗ 失败"
 
-        self.result_table.setItem(row, 0, QTableWidgetItem(action))
-        self.result_table.setItem(row, 1, QTableWidgetItem(file_path))
+            status_item = self.result_table.item(row, 2)
+            if status_item:
+                status_item.setText(status)
+                if success:
+                    status_item.setForeground(Qt.darkGreen)
+                else:
+                    status_item.setForeground(Qt.red)
 
-        status_item = QTableWidgetItem("✓ 成功" if success else "✗ 失败")
-        if success:
-            status_item.setForeground(Qt.darkGreen)
+            self._file_map[file_path] = (action, row, status)
+            self.result_table.scrollToItem(status_item)
         else:
-            status_item.setForeground(Qt.red)
-        self.result_table.setItem(row, 2, status_item)
+            # 如果不在列表中，添加新行（兼容旧逻辑）
+            row = self.result_table.rowCount()
+            self.result_table.insertRow(row)
 
-        # 滚动到最新行
-        self.result_table.scrollToBottom()
+            self.result_table.setItem(row, 0, QTableWidgetItem(action))
+            self.result_table.setItem(row, 1, QTableWidgetItem(file_path))
+
+            status_item = QTableWidgetItem("✓ 完成" if success else "✗ 失败")
+            if success:
+                status_item.setForeground(Qt.darkGreen)
+            else:
+                status_item.setForeground(Qt.red)
+            self.result_table.setItem(row, 2, status_item)
+
+            self.result_table.scrollToBottom()
 
     def on_sync_finished(self, result):
         """同步完成"""
