@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 文件同步引擎
 支持本地文件系统、FTP、SFTP 的文件同步
@@ -980,19 +979,21 @@ class SFTPConnector(FileConnector):
     - 稳定模式：适合不稳定的外网环境
     """
 
-    # ========== 性能配置 ==========
-    #
-    # 使用 paramiko 原生的 get()/put() 方法替代手动 read()/write()
-    # 性能提升: ~25倍 (2 MB/s -> 50 MB/s)
-    # 参考: GitHub paramiko issue #2235
-    #
-    # 仅保留传输层优化参数（在connect时使用）
-    WINDOW_SIZE = 128 * 1024 * 1024  # 128MB 窗口大小
-    MAX_PACKET_SIZE = 256 * 1024     # 256KB 最大包大小
+    # ========== 性能配置（降低CPU占用优化）==========
+
+    # 传输层优化参数
+    WINDOW_SIZE = 256 * 1024 * 1024  # 256MB 窗口大小（增大，减少确认次数）
+    MAX_PACKET_SIZE = 512 * 1024     # 512KB 最大包大小（增大，减少包数量）
     USE_COMPRESSION = False          # 关闭压缩，降低CPU占用
 
-    # 其他参数
-    PROGRESS_INTERVAL = 0.2  # 200ms（降低进度更新频率，减少CPU和UI刷新）
+    # 读写块大小
+    READ_CHUNK_SIZE = 2 * 1024 * 1024   # 2MB 读取块（增大，减少系统调用）
+    WRITE_CHUNK_SIZE = 2 * 1024 * 1024  # 2MB 写入块（增大，减少系统调用）
+
+    # 进度回调节流
+    PROGRESS_INTERVAL = 0.3  # 300ms（增加间隔，进一步降低UI刷新频率）
+
+    # 连接超时
     CONNECT_TIMEOUT = 30     # 30秒连接超时
     AUTH_TIMEOUT = 30        # 30秒认证超时
 
@@ -1046,22 +1047,21 @@ class SFTPConnector(FileConnector):
             # 压缩设置（根据 USE_COMPRESSION 配置）
             self.transport.use_compression(self.USE_COMPRESSION)
 
-            # 加密算法设置（使用性能更好的 CTR 模式）
+            # 【优化】加密算法设置 - 优先使用性能最好的算法
             try:
+                # 优先使用 AES-CTR 模式（硬件加速，CPU占用低）
                 self.transport.get_security_options().ciphers = (
-                    'aes128-ctr',  # 性能最好
-                    'aes256-ctr',
-                    'aes128-cbc',
-                    'aes192-ctr',
-                    'aes256-ctr',
-                    '3des-cbc'
+                    'aes128-ctr',   # 最快，硬件加速
+                    'aes256-ctr',   # 次快，硬件加速
+                    'aes128-gcm@openssh.com',  # GCM模式，性能好
+                    'aes256-gcm@openssh.com',
                 )
-                # 使用更简单的密钥交换算法
-                self.transport.get_security_options().key_types = (
-                    'ssh-rsa',
-                    'rsa-sha2-512',
-                    'rsa-sha2-256',
-                    'ssh-dss'
+                # 使用更快的密钥交换算法
+                self.transport.get_security_options().kex = (
+                    'curve25519-sha256',  # 最快的椭圆曲线算法
+                    'curve25519-sha256@libssh.org',
+                    'ecdh-sha2-nistp256',
+                    'diffie-hellman-group14-sha256',
                 )
             except:
                 pass  # 如果设置失败，使用默认值
@@ -1269,11 +1269,11 @@ class SFTPConnector(FileConnector):
     def stream_read_to_local(self, src_path: str, local_path: str, file_size: int = 0,
                               start_pos: int = 0, progress_callback=None) -> int:
         """
-        流式读取远程文件到本地（使用原生get方法,性能提升25倍）
-
-        参考: GitHub paramiko issue #2235
-        - 原生 sftp.get() 速度: ~50 MB/s
-        - 手动 read() 循环速度: ~2 MB/s
+        流式读取远程文件到本地（优化版 - 降低CPU占用）
+        优化点：
+        1. prefetch 预读取 - 减少网络往返
+        2. 2MB 大块读取 - 减少系统调用和循环次数
+        3. 节流回调（300ms）- 降低UI刷新频率
         """
         import os
         full_path = self._full_path(src_path)
@@ -1288,54 +1288,40 @@ class SFTPConnector(FileConnector):
         if local_dir and not os.path.exists(local_dir):
             os.makedirs(local_dir, exist_ok=True)
 
+        # 打开模式：追加或新建
+        mode = 'ab' if start_pos > 0 else 'wb'
         current_pos = start_pos
-
-        # 创建进度回调包装器（支持节流和取消检测）
-        def _progress_wrapper(transferred, total):
-            nonlocal current_pos
-            # 检查取消标志
-            if self._cancel_flag:
-                raise InterruptedError("用户取消传输")
-
-            # 使用节流回调，降低 CPU 占用
-            current_pos = start_pos + transferred
-            self._throttled_progress(progress_callback, current_pos, total)
 
         for retry in range(max_retries):
             try:
-                if start_pos > 0:
-                    # 断点续传：先下载到临时文件，再追加
-                    temp_path = local_path + '.sftp_resume'
-
-                    # 使用原生 get 方法下载剩余部分
-                    self.sftp.get(
-                        remotepath=full_path,
-                        localpath=temp_path,
-                        callback=_progress_wrapper if progress_callback else None
-                    )
-
-                    # 追加到原文件
-                    with open(local_path, 'ab') as dst_f:
-                        with open(temp_path, 'rb') as src_f:
-                            src_f.seek(start_pos)
-                            data = src_f.read()
-                            dst_f.write(data)
-                            bytes_transferred = len(data)
-
-                    # 删除临时文件
-                    os.remove(temp_path)
-                else:
-                    # 全新下载：直接使用原生 get 方法
-                    self.sftp.get(
-                        remotepath=full_path,
-                        localpath=local_path,
-                        callback=_progress_wrapper if progress_callback else None
-                    )
-
+                with self.sftp.open(full_path, 'rb') as remote_f:
+                    # 【优化1】预读取整个文件，减少网络往返
                     if file_size > 0:
-                        bytes_transferred = file_size
-                    elif os.path.exists(local_path):
-                        bytes_transferred = os.path.getsize(local_path)
+                        remote_f.prefetch(file_size)
+
+                    # 从指定位置开始读取
+                    if current_pos > 0:
+                        remote_f.seek(current_pos)
+
+                    with open(local_path, mode) as local_f:
+                        while True:
+                            # 检查取消标志
+                            if self._cancel_flag:
+                                raise InterruptedError("用户取消传输")
+
+                            # 【优化2】使用2MB大块读取，减少循环次数和系统调用
+                            chunk = remote_f.read(self.READ_CHUNK_SIZE)
+                            if not chunk:
+                                break
+
+                            local_f.write(chunk)
+
+                            chunk_size = len(chunk)
+                            bytes_transferred += chunk_size
+                            current_pos += chunk_size
+
+                            # 【优化3】节流回调（300ms），降低CPU占用
+                            self._throttled_progress(progress_callback, current_pos, file_size)
 
                 # 传输完成，强制更新一次进度
                 self._throttled_progress(progress_callback, current_pos, file_size, force=True)
@@ -1355,6 +1341,7 @@ class SFTPConnector(FileConnector):
                     print(f"SFTP 传输中断，尝试断点续传 ({retry + 1}/{max_retries})...")
                     if os.path.exists(local_path):
                         current_pos = os.path.getsize(local_path)
+                        mode = 'ab'
                     if self._reconnect():
                         continue
 
@@ -1365,13 +1352,12 @@ class SFTPConnector(FileConnector):
     def stream_write_from_local(self, local_path: str, dst_path: str, file_size: int = 0,
                                  start_pos: int = 0, progress_callback=None) -> int:
         """
-        流式写入本地文件到远程（使用原生put方法,性能提升25倍）
-
-        参考: GitHub paramiko issue #2235
-        - 原生 sftp.put() 速度: ~50 MB/s
-        - 手动 write() 循环速度: ~2 MB/s
+        流式写入本地文件到远程（优化版 - 降低CPU占用）
+        优化点：
+        1. pipelined 流水线写入 - 多个请求并发
+        2. 2MB 大块写入 - 减少系统调用和循环次数
+        3. 节流回调（300ms）- 降低UI刷新频率
         """
-        import os
         full_path = self._full_path(dst_path)
         bytes_transferred = 0
         max_retries = 3
@@ -1386,60 +1372,36 @@ class SFTPConnector(FileConnector):
 
         current_pos = start_pos
 
-        # 创建进度回调包装器（支持节流和取消检测）
-        def _progress_wrapper(transferred, total):
-            nonlocal current_pos
-            # 检查取消标志
-            if self._cancel_flag:
-                raise InterruptedError("用户取消传输")
-
-            # 使用节流回调，降低 CPU 占用
-            current_pos = start_pos + transferred
-            self._throttled_progress(progress_callback, current_pos, total)
-
         for retry in range(max_retries):
             try:
-                if start_pos > 0:
-                    # 断点续传：创建临时文件上传剩余部分
-                    temp_path = local_path + '.sftp_resume'
+                mode = 'ab' if current_pos > 0 else 'wb'
 
-                    # 只读取剩余部分到临时文件
-                    with open(local_path, 'rb') as src_f:
-                        src_f.seek(start_pos)
-                        with open(temp_path, 'wb') as temp_f:
-                            remaining_data = src_f.read()
-                            temp_f.write(remaining_data)
+                with open(local_path, 'rb') as local_f:
+                    if current_pos > 0:
+                        local_f.seek(current_pos)
 
-                    # 使用原生 put 上传到临时远程文件
-                    temp_remote = full_path + '.sftp_resume'
-                    self.sftp.put(
-                        localpath=temp_path,
-                        remotepath=temp_remote,
-                        callback=_progress_wrapper if progress_callback else None
-                    )
+                    with self.sftp.open(full_path, mode) as remote_f:
+                        # 【优化1】启用流水线写入，允许多个写入请求同时进行
+                        remote_f.set_pipelined(True)
 
-                    # 追加到远程文件
-                    with self.sftp.open(full_path, 'ab') as dst_f:
-                        with self.sftp.open(temp_remote, 'rb') as src_f:
-                            data = src_f.read()
-                            dst_f.write(data)
-                            bytes_transferred = len(data)
+                        while True:
+                            # 检查取消标志
+                            if self._cancel_flag:
+                                raise InterruptedError("用户取消传输")
 
-                    # 删除临时文件
-                    os.remove(temp_path)
-                    self.sftp.remove(temp_remote)
-                else:
-                    # 全新上传：直接使用原生 put 方法
-                    self.sftp.put(
-                        localpath=local_path,
-                        remotepath=full_path,
-                        callback=_progress_wrapper if progress_callback else None
-                    )
+                            # 【优化2】使用2MB大块写入，减少循环次数和系统调用
+                            chunk = local_f.read(self.WRITE_CHUNK_SIZE)
+                            if not chunk:
+                                break
 
-                    if file_size > 0:
-                        bytes_transferred = file_size
-                    elif os.path.exists(local_path):
-                        bytes_transferred = os.path.getsize(local_path)
+                            remote_f.write(chunk)
+
+                            chunk_size = len(chunk)
+                            bytes_transferred += chunk_size
+                            current_pos += chunk_size
+
+                            # 【优化3】节流回调（300ms），降低CPU占用
+                            self._throttled_progress(progress_callback, current_pos, file_size)
 
                 # 传输完成，强制更新一次进度
                 self._throttled_progress(progress_callback, current_pos, file_size, force=True)
