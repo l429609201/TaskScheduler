@@ -44,12 +44,12 @@ class TaskScheduler:
             enabled=settings.log_enabled
         )
         
-        # 配置 APScheduler
+        # 配置 APScheduler（降低线程池大小以减少CPU占用）
         jobstores = {
             'default': MemoryJobStore()
         }
         executors = {
-            'default': ThreadPoolExecutor(10)
+            'default': ThreadPoolExecutor(5)  # 从10降到5，减少线程开销
         }
         job_defaults = {
             'coalesce': True,  # 合并错过的执行
@@ -120,6 +120,9 @@ class TaskScheduler:
         if task.task_type == TaskType.SYNC:
             # 同步任务
             result = self._execute_sync_task(task)
+        elif task.task_type == TaskType.CLEANUP:
+            # 清理任务
+            result = self._execute_cleanup_task(task)
         else:
             # 命令任务
             result = self.executor.execute(
@@ -157,7 +160,7 @@ class TaskScheduler:
                 result=result,
                 parsed_vars=parsed_vars
             )
-        else:
+        elif task.task_type == TaskType.SYNC:
             # 同步任务日志
             log_file = self.task_logger.log_sync_execution(
                 task_id=task.id,
@@ -166,6 +169,17 @@ class TaskScheduler:
                 result=result,
                 parsed_vars=parsed_vars
             )
+        elif task.task_type == TaskType.CLEANUP:
+            # 清理任务日志
+            log_file = self.task_logger.log_cleanup_execution(
+                task_id=task.id,
+                task_name=task.name,
+                cleanup_config=task.cleanup_config,
+                result=result,
+                parsed_vars=parsed_vars
+            )
+        else:
+            log_file = None
         if log_file:
             logger.info(f"执行日志已保存: {log_file}")
 
@@ -300,7 +314,92 @@ class TaskScheduler:
                 start_time=start_time,
                 end_time=datetime.now()
             )
-    
+
+    def _execute_cleanup_task(self, task) -> 'ExecutionResult':
+        """执行清理任务"""
+        from core.cleanup_executor import CleanupExecutor
+        from core.executor import ExecutionResult
+
+        if not task.cleanup_config:
+            return ExecutionResult(
+                success=False,
+                exit_code=1,
+                stdout="",
+                stderr="清理配置为空",
+                start_time=datetime.now(),
+                end_time=datetime.now()
+            )
+
+        start_time = datetime.now()
+        stdout_lines = []
+        stderr_lines = []
+
+        try:
+            # 创建清理执行器
+            executor = CleanupExecutor()
+
+            # 设置进度回调
+            def on_progress(msg, current, total):
+                stdout_lines.append(f"[{current}/{total}] {msg}")
+
+            executor.set_progress_callback(on_progress)
+
+            # 执行清理
+            stdout_lines.append(f"开始清理任务...")
+            stdout_lines.append(f"目标目录: {task.cleanup_config.target_dir}")
+            stdout_lines.append(f"高阈值: {task.cleanup_config.high_threshold_gb} GB")
+            stdout_lines.append(f"低阈值: {task.cleanup_config.low_threshold_gb} GB")
+            stdout_lines.append("")
+
+            cleanup_result = executor.execute(task.cleanup_config)
+
+            # 输出结果
+            stdout_lines.append("")
+            stdout_lines.append("=" * 50)
+            if cleanup_result.skipped:
+                stdout_lines.append(f"✓ 跳过清理（未达到高阈值）")
+                stdout_lines.append(f"当前大小: {cleanup_result.initial_size_bytes / (1024**3):.2f} GB")
+            else:
+                stdout_lines.append(f"✓ 清理完成")
+                stdout_lines.append(f"初始大小: {cleanup_result.initial_size_bytes / (1024**3):.2f} GB")
+                stdout_lines.append(f"最终大小: {cleanup_result.final_size_bytes / (1024**3):.2f} GB")
+                stdout_lines.append(f"释放空间: {cleanup_result.deleted_size_bytes / (1024**3):.2f} GB")
+                stdout_lines.append(f"删除文件: {cleanup_result.deleted_count} 个")
+
+            if cleanup_result.errors:
+                stderr_lines.extend(cleanup_result.errors)
+
+            return ExecutionResult(
+                success=cleanup_result.success,
+                exit_code=0 if cleanup_result.success else 1,
+                stdout="\n".join(stdout_lines),
+                stderr="\n".join(stderr_lines),
+                start_time=start_time,
+                end_time=datetime.now(),
+                # 附加清理结果详情
+                extra_data={'cleanup_details': {
+                    'initial_size_gb': cleanup_result.initial_size_bytes / (1024**3),
+                    'final_size_gb': cleanup_result.final_size_bytes / (1024**3),
+                    'deleted_count': cleanup_result.deleted_count,
+                    'deleted_size_gb': cleanup_result.deleted_size_bytes / (1024**3),
+                    'skipped': cleanup_result.skipped
+                }}
+            )
+
+        except Exception as e:
+            import traceback
+            stderr_lines.append(f"清理执行异常: {str(e)}")
+            stderr_lines.append(traceback.format_exc())
+
+            return ExecutionResult(
+                success=False,
+                exit_code=1,
+                stdout="\n".join(stdout_lines),
+                stderr="\n".join(stderr_lines),
+                start_time=start_time,
+                end_time=datetime.now()
+            )
+
     def add_task(self, task: Task) -> bool:
         """添加任务到调度器"""
         if not task.enabled:

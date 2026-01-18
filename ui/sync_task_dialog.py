@@ -163,7 +163,7 @@ class SyncTaskDialog(QDialog):
         center_layout.addWidget(QLabel("同步线程:"))
         self.thread_spin = QSpinBox()
         self.thread_spin.setRange(1, 16)
-        self.thread_spin.setValue(2)  # 默认 2 线程，提高稳定性
+        self.thread_spin.setValue(4)  # 默认 2 线程，提高稳定性
         self.thread_spin.setToolTip("并发同步线程数 (1-16)，建议设置为 2-4")
         center_layout.addWidget(self.thread_spin)
 
@@ -2098,7 +2098,7 @@ class SyncTaskDialog(QDialog):
             self.continue_on_error_check.setChecked(config.continue_on_error)
 
             # 加载线程数
-            self.thread_spin.setValue(config.max_concurrent or 2)
+            self.thread_spin.setValue(config.max_concurrent or 4)
 
             # 过滤规则
             if config.filter_rule:

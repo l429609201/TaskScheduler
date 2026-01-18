@@ -359,10 +359,10 @@ class MainWindow(QMainWindow):
         self.scheduler.start()
         self.scheduler.load_all_tasks()  # 加载任务到调度器，这样才能计算下次执行时间
 
-        # 定时刷新（间隔稍长，避免频繁刷新导致按钮点击失效）
+        # 定时刷新（间隔稍长，避免频繁刷新导致按钮点击失效和CPU占用）
         self.refresh_timer = QTimer()
         self.refresh_timer.timeout.connect(self._safe_refresh)
-        self.refresh_timer.start(10000)  # 10秒刷新一次
+        self.refresh_timer.start(30000)  # 30秒刷新一次（降低CPU占用）
         self._mouse_over_table = False  # 鼠标是否在表格上
 
     def _init_ui(self):
@@ -492,7 +492,16 @@ class MainWindow(QMainWindow):
         # 连接标签切换事件（在所有表格创建后）
         self.tab_widget.currentChanged.connect(self._on_tab_changed)
 
-        # 状态栏
+        # 状态栏（添加进度条）
+        from PyQt5.QtWidgets import QProgressBar
+        self.status_progress = QProgressBar()
+        self.status_progress.setMaximumWidth(200)
+        self.status_progress.setTextVisible(True)
+        self.status_progress.setFormat("%p%")
+        self.status_progress.setRange(0, 100)
+        self.status_progress.setValue(0)
+        self.status_progress.hide()  # 默认隐藏
+        self.statusBar().addPermanentWidget(self.status_progress)
         self.statusBar().showMessage("就绪")
 
     def _on_tab_changed(self, index):
@@ -754,6 +763,7 @@ class MainWindow(QMainWindow):
         """添加任务 - 弹出选择对话框"""
         from PyQt5.QtWidgets import QMenu
         from .sync_task_dialog import SyncTaskDialog
+        from .cleanup_task_dialog import CleanupTaskDialog
 
         # 创建选择菜单
         menu = QMenu(self)
@@ -761,6 +771,8 @@ class MainWindow(QMainWindow):
         cmd_action.setToolTip("执行批处理命令或脚本")
         sync_action = menu.addAction("🔄 同步任务")
         sync_action.setToolTip("文件/文件夹同步")
+        cleanup_action = menu.addAction("🧹 清理任务")
+        cleanup_action.setToolTip("自动清理目录文件")
 
         # 在工具栏按钮位置显示菜单
         action = menu.exec_(self.toolbar.mapToGlobal(self.toolbar.actionGeometry(self.add_action).bottomLeft()))
@@ -783,14 +795,26 @@ class MainWindow(QMainWindow):
                 self.scheduler.add_task(task)
                 self._load_tasks()
                 self.statusBar().showMessage(f"同步任务 '{task.name}' 已添加")
+        elif action == cleanup_action:
+            # 清理任务
+            dialog = CleanupTaskDialog(task=None, parent=self)
+            if dialog.exec_():
+                task = dialog.get_task()
+                self.storage.add_task(task)
+                self.scheduler.add_task(task)
+                self._load_tasks()
+                self.statusBar().showMessage(f"清理任务 '{task.name}' 已添加")
 
     def _edit_task(self, task: Task):
         """编辑任务 - 根据任务类型选择对话框"""
         from core.models import TaskType
         from .sync_task_dialog import SyncTaskDialog
+        from .cleanup_task_dialog import CleanupTaskDialog
 
         if task.task_type == TaskType.SYNC:
             dialog = SyncTaskDialog(self, task)
+        elif task.task_type == TaskType.CLEANUP:
+            dialog = CleanupTaskDialog(task=task, parent=self)
         else:
             dialog = TaskDialog(self, task)
 
@@ -840,7 +864,7 @@ class MainWindow(QMainWindow):
             return
 
         # 创建同步引擎
-        engine = SyncEngine(task.sync_config, thread_count=task.sync_config.max_concurrent or 2)
+        engine = SyncEngine(task.sync_config, thread_count=task.sync_config.max_concurrent or 4)
 
         # 连接
         success, msg = engine.connect()
@@ -1322,6 +1346,9 @@ class MainWindow(QMainWindow):
     def _on_task_start(self, task: Task):
         """任务开始回调"""
         self.statusBar().showMessage(f"任务 '{task.name}' 正在执行...")
+        # 显示进度条（不确定模式）
+        self.status_progress.setRange(0, 0)  # 不确定模式
+        self.status_progress.show()
         # 刷新任务列表以显示状态变化
         if self.current_page == 0:
             QTimer.singleShot(100, self._load_tasks)
@@ -1330,6 +1357,10 @@ class MainWindow(QMainWindow):
         """任务完成回调"""
         status = "成功" if result.success else "失败"
         self.statusBar().showMessage(f"任务 '{task.name}' 执行{status}")
+        # 隐藏进度条
+        self.status_progress.hide()
+        self.status_progress.setRange(0, 100)
+        self.status_progress.setValue(0)
         # 刷新任务列表以显示状态变化
         if self.current_page == 0:
             QTimer.singleShot(100, self._load_tasks)

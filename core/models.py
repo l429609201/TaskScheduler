@@ -24,6 +24,7 @@ class TaskType(Enum):
     """任务类型枚举"""
     COMMAND = "command"      # 命令任务（原有功能）
     SYNC = "sync"            # 文件同步任务
+    CLEANUP = "cleanup"      # 清理任务
 
 
 class ConnectionType(Enum):
@@ -171,7 +172,7 @@ class SyncConfig:
     # 失败后是否继续
     continue_on_error: bool = True
     # 最大并发传输数（默认 2，提高稳定性）
-    max_concurrent: int = 2
+    max_concurrent: int = 4
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -196,6 +197,36 @@ class SyncConfig:
         data['sync_mode'] = SyncMode(data.get('sync_mode', 'update'))
         data['compare_method'] = CompareMethod(data.get('compare_method', 'time_size'))
         data['filter_rule'] = SyncFilterRule.from_dict(data.get('filter_rule', {}))
+        return cls(**data)
+
+
+@dataclass
+class CleanupConfig:
+    """清理任务配置"""
+    # 目标目录路径
+    target_dir: str = ""
+    # 低阈值（GB）- 清理到这个大小以下停止
+    low_threshold_gb: float = 10.0
+    # 高阈值（GB）- 超过这个大小开始清理
+    high_threshold_gb: float = 20.0
+    # 是否递归清理子目录
+    recursive: bool = True
+    # 文件扩展名过滤（为空表示所有文件，如 ['.log', '.tmp']）
+    file_extensions: List[str] = field(default_factory=list)
+    # 排除的文件名模式（支持通配符，如 ['*.keep', 'important_*']）
+    exclude_patterns: List[str] = field(default_factory=list)
+    # 是否只删除文件（保留空目录）
+    files_only: bool = True
+    # 是否在删除前进行确认（用于手动执行）
+    confirm_before_delete: bool = False
+    # 最小文件年龄（天）- 只删除超过这个天数的文件
+    min_age_days: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'CleanupConfig':
         return cls(**data)
 
 
@@ -328,6 +359,9 @@ class Task:
     # ===== 同步任务配置 =====
     # 同步配置（仅当 task_type == SYNC 时使用）
     sync_config: Optional[SyncConfig] = None
+    # ===== 清理任务配置 =====
+    # 清理配置（仅当 task_type == CLEANUP 时使用）
+    cleanup_config: Optional[CleanupConfig] = None
     # ===== 通用配置 =====
     # Cron 表达式 (秒 分 时 日 月 周)
     cron_expression: str = "0 0 * * * *"
@@ -359,6 +393,8 @@ class Task:
         data['output_parsers'] = [p.to_dict() if isinstance(p, OutputParser) else p for p in self.output_parsers]
         if self.sync_config:
             data['sync_config'] = self.sync_config.to_dict()
+        if self.cleanup_config:
+            data['cleanup_config'] = self.cleanup_config.to_dict()
         return data
 
     @classmethod
@@ -385,13 +421,16 @@ class Task:
         data['output_parsers'] = [OutputParser.from_dict(p) if isinstance(p, dict) else p for p in data.get('output_parsers', [])]
         if data.get('sync_config'):
             data['sync_config'] = SyncConfig.from_dict(data['sync_config'])
+        if data.get('cleanup_config'):
+            data['cleanup_config'] = CleanupConfig.from_dict(data['cleanup_config'])
         return cls(**data)
 
     def get_type_display(self) -> str:
         """获取任务类型显示名称"""
         type_names = {
             TaskType.COMMAND: "命令任务",
-            TaskType.SYNC: "同步任务"
+            TaskType.SYNC: "同步任务",
+            TaskType.CLEANUP: "清理任务"
         }
         return type_names.get(self.task_type, "未知")
 

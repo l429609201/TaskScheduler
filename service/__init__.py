@@ -1,6 +1,4 @@
-# Windows Service modules
-from .task_service import TaskSchedulerService
-from .installer import ServiceInstaller
+# Windows Service modules (deprecated - now using Task Scheduler)
+# This package is kept for compatibility but is no longer used
 
-__all__ = ['TaskSchedulerService', 'ServiceInstaller']
-
+__all__ = []

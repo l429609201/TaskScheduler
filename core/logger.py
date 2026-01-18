@@ -377,3 +377,113 @@ class TaskLogger:
 
         return "\n".join(lines)
 
+    def log_cleanup_execution(self, task_id: str, task_name: str,
+                              cleanup_config, result, parsed_vars: Dict[str, str] = None) -> Optional[str]:
+        """
+        记录清理任务执行结果
+
+        Args:
+            task_id: 任务ID
+            task_name: 任务名称
+            cleanup_config: CleanupConfig 对象
+            result: ExecutionResult 对象
+            parsed_vars: 解析器提取的变量字典
+
+        Returns:
+            日志文件路径，如果未启用则返回 None
+        """
+        if not self._enabled:
+            return None
+
+        try:
+            self._ensure_log_dir()
+
+            # 生成日志文件名
+            filename = self._get_log_filename(task_name, result.start_time)
+            filepath = os.path.join(self._log_dir, filename)
+
+            # 构建日志内容
+            log_content = self._format_cleanup_log(task_id, task_name, cleanup_config, result, parsed_vars)
+
+            # 写入文件
+            with self._lock:
+                with open(filepath, 'w', encoding='utf-8') as f:
+                    f.write(log_content)
+
+            return filepath
+
+        except Exception as e:
+            print(f"写入清理日志失败: {e}")
+            return None
+
+    def _format_cleanup_log(self, task_id: str, task_name: str,
+                            cleanup_config, result, parsed_vars: Dict[str, str] = None) -> str:
+        """格式化清理任务日志内容"""
+        separator = "=" * 60
+
+        # 获取清理配置信息
+        target_dir = cleanup_config.target_dir if cleanup_config else "未知"
+        low_threshold = cleanup_config.low_threshold_gb if cleanup_config else 0
+        high_threshold = cleanup_config.high_threshold_gb if cleanup_config else 0
+
+        lines = [
+            separator,
+            "清理任务执行日志",
+            separator,
+            "",
+            f"任务名称: {task_name}",
+            f"任务ID: {task_id}",
+            f"任务类型: 目录清理",
+            "",
+            f"目标目录: {target_dir}",
+            f"高阈值: {high_threshold} GB",
+            f"低阈值: {low_threshold} GB",
+            "",
+            f"开始时间: {result.start_time.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"结束时间: {result.end_time.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"执行时长: {result.duration:.2f} 秒",
+            "",
+            f"执行状态: {'成功' if result.success else '失败'}",
+            f"退出代码: {result.exit_code}",
+            "",
+        ]
+
+        # 添加解析器提取的变量
+        if parsed_vars:
+            lines.extend([
+                separator,
+                "解析器提取的变量",
+                separator,
+            ])
+            for var_name, value in parsed_vars.items():
+                lines.append(f"  {var_name} = {value}")
+            lines.append("")
+
+        # 添加清理详情
+        if result.stdout:
+            lines.extend([
+                separator,
+                "清理详情",
+                separator,
+                result.stdout,
+                "",
+            ])
+
+        # 添加错误信息
+        if result.stderr:
+            lines.extend([
+                separator,
+                "错误信息",
+                separator,
+                result.stderr,
+                "",
+            ])
+
+        lines.extend([
+            separator,
+            f"日志生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            separator,
+        ])
+
+        return "\n".join(lines)
+

@@ -143,30 +143,6 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(behavior_group)
 
-        # 启动设置组
-        startup_group = QGroupBox("启动设置")
-        startup_layout = QFormLayout(startup_group)
-
-        # 开机启动
-        startup_widget = QWidget()
-        startup_h_layout = QHBoxLayout(startup_widget)
-        startup_h_layout.setContentsMargins(0, 0, 0, 0)
-
-        self.startup_check = QCheckBox("开机时自动启动程序")
-        self.startup_check.setToolTip("登录 Windows 后自动启动任务调度器（带托盘图标）")
-        startup_h_layout.addWidget(self.startup_check)
-
-        startup_h_layout.addStretch()
-
-        startup_layout.addRow("", startup_widget)
-
-        # 启动状态提示
-        self.startup_status_label = QLabel()
-        self.startup_status_label.setStyleSheet("color: gray; font-size: 11px;")
-        startup_layout.addRow("", self.startup_status_label)
-
-        layout.addWidget(startup_group)
-
         layout.addStretch()
 
         return tab
@@ -400,24 +376,9 @@ class SettingsDialog(QDialog):
         if index >= 0:
             self.close_action_combo.setCurrentIndex(index)
 
-        # 开机启动状态
-        from service.installer import StartupManager
-        is_startup = StartupManager.is_enabled()
-        self.startup_check.setChecked(is_startup)
-        self._update_startup_status(is_startup)
-
         self._update_log_info()
         self._on_log_enabled_changed()
 
-    def _update_startup_status(self, enabled: bool):
-        """更新开机启动状态显示"""
-        if enabled:
-            self.startup_status_label.setText("✓ 已设置开机启动")
-            self.startup_status_label.setStyleSheet("color: #4ec9b0; font-size: 11px;")
-        else:
-            self.startup_status_label.setText("未设置开机启动")
-            self.startup_status_label.setStyleSheet("color: gray; font-size: 11px;")
-    
     def _on_log_enabled_changed(self):
         """日志启用状态改变"""
         enabled = self.log_enabled_check.isChecked()
@@ -527,20 +488,6 @@ class SettingsDialog(QDialog):
         self.settings.log_dir = self.log_dir_edit.text() or "logs"
         self.settings.log_retention_days = self.retention_spin.value()
         self.settings.close_action = self.close_action_combo.currentData()
-
-        # 处理开机启动设置
-        from service.installer import StartupManager
-        current_startup = StartupManager.is_enabled()
-        want_startup = self.startup_check.isChecked()
-
-        if want_startup != current_startup:
-            if want_startup:
-                success, msg = StartupManager.enable()
-            else:
-                success, msg = StartupManager.disable()
-
-            if not success:
-                MsgBox.warning(self, "开机启动设置", msg)
 
         self.settings_changed = True
         self.accept()

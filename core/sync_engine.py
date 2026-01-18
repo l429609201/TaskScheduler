@@ -249,7 +249,7 @@ class LocalConnector(FileConnector):
     """本地文件系统连接器"""
 
     # 进度回调最小间隔（秒）- 降低 CPU 占用
-    PROGRESS_INTERVAL = 0.1  # 100ms
+    PROGRESS_INTERVAL = 0.5  # 500ms（降低UI刷新频率）
 
     def __init__(self, config: ConnectionConfig):
         super().__init__(config)
@@ -972,25 +972,29 @@ class FTPConnector(FileConnector):
 
 
 class SFTPConnector(FileConnector):
-    """SFTP 连接器 - 稳定性优化版"""
+    """SFTP 连接器 - 平衡性能与稳定性
 
-    # 优化的传输参数（针对网络稳定性）
-    # 窗口大小：64MB（降低以提高稳定性）
-    WINDOW_SIZE = 64 * 1024 * 1024  # 64MB
-    # 最大数据包大小：32KB（SSH 标准值，避免 Garbage packet 错误）
-    MAX_PACKET_SIZE = 32 * 1024  # 32KB
-    # 读取块大小：512KB（降低以提高稳定性）
-    READ_CHUNK_SIZE = 512 * 1024  # 512KB
-    # 写入块大小：512KB
-    WRITE_CHUNK_SIZE = 512 * 1024  # 512KB
-    # 预读取请求数量（流水线深度）
-    PREFETCH_REQUESTS = 32  # 降低以减少网络负担
-    # 进度回调最小间隔（秒）- 降低 CPU 占用
-    PROGRESS_INTERVAL = 0.1  # 100ms
-    # 连接超时（秒）
-    CONNECT_TIMEOUT = 60  # 60 秒
-    # 认证超时（秒）
-    AUTH_TIMEOUT = 60  # 60 秒
+    配置说明：
+    - 高性能模式：适合稳定的内网环境
+    - 平衡模式：适合大多数网络环境（默认）
+    - 稳定模式：适合不稳定的外网环境
+    """
+
+    # ========== 性能配置 ==========
+    #
+    # 使用 paramiko 原生的 get()/put() 方法替代手动 read()/write()
+    # 性能提升: ~25倍 (2 MB/s -> 50 MB/s)
+    # 参考: GitHub paramiko issue #2235
+    #
+    # 仅保留传输层优化参数（在connect时使用）
+    WINDOW_SIZE = 128 * 1024 * 1024  # 128MB 窗口大小
+    MAX_PACKET_SIZE = 256 * 1024     # 256KB 最大包大小
+    USE_COMPRESSION = False          # 关闭压缩，降低CPU占用
+
+    # 其他参数
+    PROGRESS_INTERVAL = 0.2  # 200ms（降低进度更新频率，减少CPU和UI刷新）
+    CONNECT_TIMEOUT = 30     # 30秒连接超时
+    AUTH_TIMEOUT = 30        # 30秒认证超时
 
     def __init__(self, config: ConnectionConfig):
         super().__init__(config)
@@ -1039,16 +1043,15 @@ class SFTPConnector(FileConnector):
             # 设置 keepalive，防止长时间传输时连接断开
             self.transport.set_keepalive(30)
 
-            # 启用压缩（减少数据传输量，提高稳定性）
-            self.transport.use_compression(True)
+            # 压缩设置（根据 USE_COMPRESSION 配置）
+            self.transport.use_compression(self.USE_COMPRESSION)
 
-            # 使用更稳定的加密算法（优先使用 CBC 模式，更稳定）
-            # 避免使用过于激进的算法导致 Garbage packet 错误
+            # 加密算法设置（使用性能更好的 CTR 模式）
             try:
                 self.transport.get_security_options().ciphers = (
-                    'aes128-cbc',  # 最稳定的算法
-                    'aes256-cbc',
-                    'aes128-ctr',
+                    'aes128-ctr',  # 性能最好
+                    'aes256-ctr',
+                    'aes128-cbc',
                     'aes192-ctr',
                     'aes256-ctr',
                     '3des-cbc'
@@ -1266,7 +1269,11 @@ class SFTPConnector(FileConnector):
     def stream_read_to_local(self, src_path: str, local_path: str, file_size: int = 0,
                               start_pos: int = 0, progress_callback=None) -> int:
         """
-        流式读取远程文件到本地（高速优化版，使用 prefetch）
+        流式读取远程文件到本地（使用原生get方法,性能提升25倍）
+
+        参考: GitHub paramiko issue #2235
+        - 原生 sftp.get() 速度: ~50 MB/s
+        - 手动 read() 循环速度: ~2 MB/s
         """
         import os
         full_path = self._full_path(src_path)
@@ -1281,38 +1288,54 @@ class SFTPConnector(FileConnector):
         if local_dir and not os.path.exists(local_dir):
             os.makedirs(local_dir, exist_ok=True)
 
-        # 打开模式：追加或新建
-        mode = 'ab' if start_pos > 0 else 'wb'
         current_pos = start_pos
+
+        # 创建进度回调包装器（支持节流和取消检测）
+        def _progress_wrapper(transferred, total):
+            nonlocal current_pos
+            # 检查取消标志
+            if self._cancel_flag:
+                raise InterruptedError("用户取消传输")
+
+            # 使用节流回调，降低 CPU 占用
+            current_pos = start_pos + transferred
+            self._throttled_progress(progress_callback, current_pos, total)
 
         for retry in range(max_retries):
             try:
-                with self.sftp.open(full_path, 'rb') as remote_f:
-                    # 设置预读取大小（关键优化！）
-                    remote_f.prefetch(file_size)
+                if start_pos > 0:
+                    # 断点续传：先下载到临时文件，再追加
+                    temp_path = local_path + '.sftp_resume'
 
-                    if current_pos > 0:
-                        remote_f.seek(current_pos)
+                    # 使用原生 get 方法下载剩余部分
+                    self.sftp.get(
+                        remotepath=full_path,
+                        localpath=temp_path,
+                        callback=_progress_wrapper if progress_callback else None
+                    )
 
-                    with open(local_path, mode) as local_f:
-                        while True:
-                            # 检查取消标志
-                            if self._cancel_flag:
-                                raise InterruptedError("用户取消传输")
+                    # 追加到原文件
+                    with open(local_path, 'ab') as dst_f:
+                        with open(temp_path, 'rb') as src_f:
+                            src_f.seek(start_pos)
+                            data = src_f.read()
+                            dst_f.write(data)
+                            bytes_transferred = len(data)
 
-                            # 使用更大的块大小
-                            chunk = remote_f.read(self.READ_CHUNK_SIZE)
-                            if not chunk:
-                                break
+                    # 删除临时文件
+                    os.remove(temp_path)
+                else:
+                    # 全新下载：直接使用原生 get 方法
+                    self.sftp.get(
+                        remotepath=full_path,
+                        localpath=local_path,
+                        callback=_progress_wrapper if progress_callback else None
+                    )
 
-                            local_f.write(chunk)
-
-                            chunk_size = len(chunk)
-                            bytes_transferred += chunk_size
-                            current_pos += chunk_size
-
-                            # 使用节流回调，降低 CPU 占用
-                            self._throttled_progress(progress_callback, current_pos, file_size)
+                    if file_size > 0:
+                        bytes_transferred = file_size
+                    elif os.path.exists(local_path):
+                        bytes_transferred = os.path.getsize(local_path)
 
                 # 传输完成，强制更新一次进度
                 self._throttled_progress(progress_callback, current_pos, file_size, force=True)
@@ -1332,7 +1355,6 @@ class SFTPConnector(FileConnector):
                     print(f"SFTP 传输中断，尝试断点续传 ({retry + 1}/{max_retries})...")
                     if os.path.exists(local_path):
                         current_pos = os.path.getsize(local_path)
-                        mode = 'ab'
                     if self._reconnect():
                         continue
 
@@ -1343,8 +1365,13 @@ class SFTPConnector(FileConnector):
     def stream_write_from_local(self, local_path: str, dst_path: str, file_size: int = 0,
                                  start_pos: int = 0, progress_callback=None) -> int:
         """
-        流式写入本地文件到远程（高速优化版，使用 pipelined 写入）
+        流式写入本地文件到远程（使用原生put方法,性能提升25倍）
+
+        参考: GitHub paramiko issue #2235
+        - 原生 sftp.put() 速度: ~50 MB/s
+        - 手动 write() 循环速度: ~2 MB/s
         """
+        import os
         full_path = self._full_path(dst_path)
         bytes_transferred = 0
         max_retries = 3
@@ -1359,37 +1386,60 @@ class SFTPConnector(FileConnector):
 
         current_pos = start_pos
 
+        # 创建进度回调包装器（支持节流和取消检测）
+        def _progress_wrapper(transferred, total):
+            nonlocal current_pos
+            # 检查取消标志
+            if self._cancel_flag:
+                raise InterruptedError("用户取消传输")
+
+            # 使用节流回调，降低 CPU 占用
+            current_pos = start_pos + transferred
+            self._throttled_progress(progress_callback, current_pos, total)
+
         for retry in range(max_retries):
             try:
-                mode = 'ab' if current_pos > 0 else 'wb'
+                if start_pos > 0:
+                    # 断点续传：创建临时文件上传剩余部分
+                    temp_path = local_path + '.sftp_resume'
 
-                with open(local_path, 'rb') as local_f:
-                    if current_pos > 0:
-                        local_f.seek(current_pos)
+                    # 只读取剩余部分到临时文件
+                    with open(local_path, 'rb') as src_f:
+                        src_f.seek(start_pos)
+                        with open(temp_path, 'wb') as temp_f:
+                            remaining_data = src_f.read()
+                            temp_f.write(remaining_data)
 
-                    with self.sftp.open(full_path, mode) as remote_f:
-                        # 启用流水线写入（关键优化！）
-                        # 这允许多个写入请求同时进行，不需要等待每个确认
-                        remote_f.set_pipelined(True)
+                    # 使用原生 put 上传到临时远程文件
+                    temp_remote = full_path + '.sftp_resume'
+                    self.sftp.put(
+                        localpath=temp_path,
+                        remotepath=temp_remote,
+                        callback=_progress_wrapper if progress_callback else None
+                    )
 
-                        while True:
-                            # 检查取消标志
-                            if self._cancel_flag:
-                                raise InterruptedError("用户取消传输")
+                    # 追加到远程文件
+                    with self.sftp.open(full_path, 'ab') as dst_f:
+                        with self.sftp.open(temp_remote, 'rb') as src_f:
+                            data = src_f.read()
+                            dst_f.write(data)
+                            bytes_transferred = len(data)
 
-                            # 使用更大的块大小
-                            chunk = local_f.read(self.WRITE_CHUNK_SIZE)
-                            if not chunk:
-                                break
+                    # 删除临时文件
+                    os.remove(temp_path)
+                    self.sftp.remove(temp_remote)
+                else:
+                    # 全新上传：直接使用原生 put 方法
+                    self.sftp.put(
+                        localpath=local_path,
+                        remotepath=full_path,
+                        callback=_progress_wrapper if progress_callback else None
+                    )
 
-                            remote_f.write(chunk)
-
-                            chunk_size = len(chunk)
-                            bytes_transferred += chunk_size
-                            current_pos += chunk_size
-
-                            # 使用节流回调，降低 CPU 占用
-                            self._throttled_progress(progress_callback, current_pos, file_size)
+                    if file_size > 0:
+                        bytes_transferred = file_size
+                    elif os.path.exists(local_path):
+                        bytes_transferred = os.path.getsize(local_path)
 
                 # 传输完成，强制更新一次进度
                 self._throttled_progress(progress_callback, current_pos, file_size, force=True)
@@ -1689,7 +1739,7 @@ def create_connector(config: ConnectionConfig) -> FileConnector:
 class SyncEngine:
     """文件同步引擎 - 支持多线程"""
 
-    def __init__(self, config: SyncConfig, thread_count: int = 2):
+    def __init__(self, config: SyncConfig, thread_count: int = 4):
         self.config = config
         self.thread_count = max(1, min(thread_count, 16))  # 限制 1-16 线程
         self.source_connector: Optional[FileConnector] = None
@@ -1700,7 +1750,8 @@ class SyncEngine:
         self._lock = threading.Lock()
         self._current_file = ""
         self._processed_count = 0
-        self._transferred_bytes = 0  # 追踪传输的字节数
+        self._transferred_bytes = 0  # 总传输字节数（所有线程累计）
+        self._thread_bytes = {}  # 每个线程当前文件的传输字节数 {thread_id: bytes}
 
         # 连接池 - 为每个线程创建独立连接
         self._source_pool: List[FileConnector] = []
@@ -1714,6 +1765,12 @@ class SyncEngine:
     def set_file_completed_callback(self, callback: Callable[[str, str, bool, int], None]):
         """设置文件完成回调: callback(file_path, action, success, bytes_transferred)"""
         self._file_completed_callback = callback
+
+    def get_total_transferred_bytes(self) -> int:
+        """获取总传输字节数（包括已完成和正在传输的文件）"""
+        with self._lock:
+            # 已完成文件的字节数 + 所有正在传输文件的字节数
+            return self._transferred_bytes + sum(self._thread_bytes.values())
 
     def _create_connector(self, config: ConnectionConfig) -> Optional[FileConnector]:
         """创建单个连接器"""
@@ -1937,18 +1994,22 @@ class SyncEngine:
         file_path = item.relative_path
         file_size = item.source_file.size if item.source_file else (item.target_file.size if item.target_file else 0)
 
-        # 记录传输开始前的字节数
+        # 初始化当前线程的字节计数
         with self._lock:
-            bytes_before = self._transferred_bytes
+            self._thread_bytes[thread_id] = 0
 
-        # 设置传输进度回调 - 实时更新传输字节数
+        # 设置传输进度回调 - 使用线程独立计数
         def transfer_progress(transferred, total):
             with self._lock:
-                self._transferred_bytes = bytes_before + transferred
+                # 更新当前线程的传输字节数
+                self._thread_bytes[thread_id] = transferred
+                # 计算所有线程的总传输字节数
+                total_transferred = self._transferred_bytes + sum(self._thread_bytes.values())
+
             if self._progress_callback:
                 percent = int(transferred * 100 / total) if total > 0 else 0
                 self._progress_callback(
-                    f"[线程{thread_id+1}] 传输: {file_path} ({percent}%)",
+                    f"传输: {file_path} ({percent}%)",
                     self._processed_count,
                     result.total_files
                 )
@@ -1968,7 +2029,9 @@ class SyncEngine:
                     resume=True
                 )
                 with self._lock:
+                    # 累加到总字节数，清理线程计数
                     self._transferred_bytes += bytes_transferred
+                    self._thread_bytes[thread_id] = 0
                     result.copied_files += 1
                 logger.debug(f"[线程{thread_id+1}] 复制完成: {item.source_file.path}, {bytes_transferred} bytes")
 
@@ -1983,7 +2046,9 @@ class SyncEngine:
                     resume=True
                 )
                 with self._lock:
+                    # 累加到总字节数，清理线程计数
                     self._transferred_bytes += bytes_transferred
+                    self._thread_bytes[thread_id] = 0
                     result.copied_files += 1
                 logger.debug(f"[线程{thread_id+1}] 复制完成: {item.target_file.path}, {bytes_transferred} bytes")
 
@@ -1998,7 +2063,9 @@ class SyncEngine:
                     resume=True
                 )
                 with self._lock:
+                    # 累加到总字节数，清理线程计数
                     self._transferred_bytes += bytes_transferred
+                    self._thread_bytes[thread_id] = 0
                     result.updated_files += 1
                 logger.debug(f"[线程{thread_id+1}] 更新完成: {item.source_file.path}, {bytes_transferred} bytes")
 
@@ -2013,7 +2080,9 @@ class SyncEngine:
                     resume=True
                 )
                 with self._lock:
+                    # 累加到总字节数，清理线程计数
                     self._transferred_bytes += bytes_transferred
+                    self._thread_bytes[thread_id] = 0
                     result.updated_files += 1
                 logger.debug(f"[线程{thread_id+1}] 更新完成: {item.target_file.path}, {bytes_transferred} bytes")
 
@@ -2022,6 +2091,7 @@ class SyncEngine:
                 logger.debug(f"[线程{thread_id+1}] 删除目标: {item.target_file.path}")
                 target_conn.delete_file(item.target_file.path)
                 with self._lock:
+                    self._thread_bytes[thread_id] = 0  # 清理线程计数
                     result.deleted_files += 1
                 logger.debug(f"[线程{thread_id+1}] 删除完成: {item.target_file.path}")
 
@@ -2030,8 +2100,13 @@ class SyncEngine:
                 logger.debug(f"[线程{thread_id+1}] 删除源: {item.source_file.path}")
                 source_conn.delete_file(item.source_file.path)
                 with self._lock:
+                    self._thread_bytes[thread_id] = 0  # 清理线程计数
                     result.deleted_files += 1
                 logger.debug(f"[线程{thread_id+1}] 删除完成: {item.source_file.path}")
+
+            # 成功完成，清理线程计数
+            with self._lock:
+                self._thread_bytes[thread_id] = 0
 
             return action_name, file_path, True, bytes_transferred
 
@@ -2041,6 +2116,7 @@ class SyncEngine:
             error_msg = _safe_error_message(e)
 
             with self._lock:
+                self._thread_bytes[thread_id] = 0  # 失败时也清理线程计数
                 result.errors.append(f"{file_path}: {error_msg}")
             return action_name, file_path, False, 0
 
@@ -2053,7 +2129,8 @@ class SyncEngine:
         result = SyncResult()
         self._cancel_flag = False
         self._processed_count = 0
-        self._transferred_bytes = 0  # 重置传输字节数
+        self._transferred_bytes = 0  # 重置总传输字节数
+        self._thread_bytes = {}  # 重置线程字节计数
 
         # 重置连接器的取消标志
         if self.source_connector and hasattr(self.source_connector, 'reset_cancel'):

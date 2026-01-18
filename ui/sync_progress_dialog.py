@@ -35,8 +35,10 @@ class SyncWorkerThread(QThread):
         try:
             # 设置进度回调
             def on_progress(msg, current, total):
-                logger.debug(f"进度回调: {msg}, {current}/{total}, 传输字节: {self.engine._transferred_bytes}")
-                self.progress_updated.emit(msg, current, total, self.engine._transferred_bytes)
+                # 获取总传输字节数（包括所有线程正在传输的文件）
+                total_bytes = self.engine.get_total_transferred_bytes()
+                logger.debug(f"进度回调: {msg}, {current}/{total}, 传输字节: {total_bytes}")
+                self.progress_updated.emit(msg, current, total, total_bytes)
 
             self.engine.set_progress_callback(on_progress)
 

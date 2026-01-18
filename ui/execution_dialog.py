@@ -64,6 +64,9 @@ class ExecutionThread(QThread):
             if self.task.task_type == TaskType.SYNC:
                 logger.info(f"[ExecutionThread] 执行同步任务")
                 exit_code = self._run_sync_task()
+            elif self.task.task_type == TaskType.CLEANUP:
+                logger.info(f"[ExecutionThread] 执行清理任务")
+                exit_code = self._run_cleanup_task()
             else:
                 logger.info(f"[ExecutionThread] 执行命令任务")
                 exit_code = self._run_command_task()
@@ -277,6 +280,64 @@ class ExecutionThread(QThread):
         except Exception as e:
             import traceback
             self.output_received.emit(f"\n同步执行异常: {e}\n", 'stderr')
+            self.output_received.emit(traceback.format_exc(), 'stderr')
+            return 1
+
+    def _run_cleanup_task(self):
+        """执行清理任务"""
+        exit_code = -1
+
+        self.output_received.emit(f"开始执行清理任务: {self.task.name}\n", 'info')
+        self.output_received.emit("=" * 50 + "\n\n", 'info')
+
+        if not self.task.cleanup_config:
+            self.output_received.emit("错误: 清理配置为空\n", 'stderr')
+            return 1
+
+        try:
+            from core.cleanup_executor import CleanupExecutor
+
+            # 创建清理执行器
+            executor = CleanupExecutor()
+
+            # 设置进度回调
+            def on_progress(msg, current, total):
+                self.output_received.emit(f"[{current}/{total}] {msg}\n", 'info')
+
+            executor.set_progress_callback(on_progress)
+
+            # 显示配置
+            config = self.task.cleanup_config
+            self.output_received.emit(f"目标目录: {config.target_dir}\n", 'info')
+            self.output_received.emit(f"高阈值: {config.high_threshold_gb} GB\n", 'info')
+            self.output_received.emit(f"低阈值: {config.low_threshold_gb} GB\n", 'info')
+            self.output_received.emit("\n", 'info')
+
+            # 执行清理
+            cleanup_result = executor.execute(config)
+
+            # 显示结果
+            self.output_received.emit("\n" + "=" * 50 + "\n", 'info')
+            if cleanup_result.skipped:
+                self.output_received.emit("✓ 跳过清理（未达到高阈值）\n", 'info')
+                self.output_received.emit(f"当前大小: {cleanup_result.initial_size_bytes / (1024**3):.2f} GB\n", 'info')
+            else:
+                self.output_received.emit("✓ 清理完成\n", 'info')
+                self.output_received.emit(f"初始大小: {cleanup_result.initial_size_bytes / (1024**3):.2f} GB\n", 'info')
+                self.output_received.emit(f"最终大小: {cleanup_result.final_size_bytes / (1024**3):.2f} GB\n", 'info')
+                self.output_received.emit(f"释放空间: {cleanup_result.deleted_size_bytes / (1024**3):.2f} GB\n", 'info')
+                self.output_received.emit(f"删除文件: {cleanup_result.deleted_count} 个\n", 'info')
+
+            if cleanup_result.errors:
+                self.output_received.emit(f"\n错误信息:\n", 'stderr')
+                for err in cleanup_result.errors:
+                    self.output_received.emit(f"  - {err}\n", 'stderr')
+
+            return 0 if cleanup_result.success else 1
+
+        except Exception as e:
+            import traceback
+            self.output_received.emit(f"\n清理执行异常: {e}\n", 'stderr')
             self.output_received.emit(traceback.format_exc(), 'stderr')
             return 1
 

@@ -4,17 +4,111 @@
 """
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QSplitter, QWidget,
     QListWidget, QListWidgetItem, QTextEdit, QLabel,
-    QPushButton, QFileDialog, QLineEdit, QCheckBox, QFrame
+    QPushButton, QFileDialog, QLineEdit, QCheckBox, QFrame,
+    QComboBox, QDateEdit, QGroupBox, QProgressBar
 )
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, QDate, QThread, pyqtSignal
 from PyQt5.QtGui import QFont, QTextCursor, QTextCharFormat, QColor
 
 from core.logger import TaskLogger
 from .message_box import MsgBox
+
+
+class LogFileLoader(QThread):
+    """异步加载日志文件列表的工作线程"""
+
+    # 信号：加载进度 (当前数量, 总数量)
+    progress = pyqtSignal(int, int)
+    # 信号：加载完成 (文件列表)
+    finished = pyqtSignal(list)
+    # 信号：加载错误
+    error = pyqtSignal(str)
+
+    def __init__(self, log_dir: str, task_name: str):
+        super().__init__()
+        self.log_dir = log_dir
+        self.task_name = task_name
+        self._is_cancelled = False
+
+    def cancel(self):
+        """取消加载"""
+        self._is_cancelled = True
+
+    def run(self):
+        """执行加载"""
+        try:
+            # 清理任务名用于匹配文件
+            safe_name = "".join(c if c.isalnum() or c in ('-', '_', ' ') else '_' for c in self.task_name)
+            safe_name = safe_name.strip().replace(' ', '_')
+            prefix = safe_name + '_'
+
+            if not os.path.exists(self.log_dir):
+                self.finished.emit([])
+                return
+
+            files = []
+            count = 0
+
+            # 使用 scandir 扫描文件
+            with os.scandir(self.log_dir) as entries:
+                for entry in entries:
+                    # 检查是否取消
+                    if self._is_cancelled:
+                        return
+
+                    # 快速过滤
+                    if not entry.is_file() or not entry.name.endswith('.log'):
+                        continue
+                    if not entry.name.startswith(prefix):
+                        continue
+
+                    try:
+                        stat_info = entry.stat()
+                        mtime = stat_info.st_mtime
+                        display_time = self._parse_display_time(entry.name, mtime)
+                        files.append((entry.name, entry.path, mtime, display_time))
+
+                        count += 1
+                        # 每10个文件更新一次进度
+                        if count % 10 == 0:
+                            self.progress.emit(count, -1)
+                    except (OSError, ValueError):
+                        continue
+
+            # 检查是否取消
+            if self._is_cancelled:
+                return
+
+            # 按时间倒序排序
+            files.sort(key=lambda x: x[2], reverse=True)
+
+            # 发送完成信号
+            self.finished.emit(files)
+
+        except Exception as e:
+            self.error.emit(str(e))
+
+    def _parse_display_time(self, filename: str, mtime: float) -> str:
+        """解析文件名中的时间"""
+        try:
+            name_without_ext = filename[:-4]
+            parts = name_without_ext.rsplit('_', 2)
+
+            if len(parts) >= 3:
+                date_str = parts[-2]
+                time_str = parts[-1]
+
+                if len(date_str) == 8 and len(time_str) == 6:
+                    if date_str.isdigit() and time_str.isdigit():
+                        return f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]} {time_str[:2]}:{time_str[2:4]}:{time_str[4:]}"
+        except (IndexError, ValueError):
+            pass
+
+        return datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M:%S')
 
 
 class LogViewerDialog(QDialog):
@@ -31,8 +125,20 @@ class LogViewerDialog(QDialog):
         self._current_match_index = -1  # 当前高亮的匹配索引
         self._original_content = ""  # 原始日志内容
 
+        # 所有日志文件（用于过滤）
+        self._all_log_files = []  # [(filename, filepath, mtime, display_time), ...]
+
+        # 筛选去抖动定时器
+        self._filter_timer = QTimer()
+        self._filter_timer.setSingleShot(True)
+        self._filter_timer.timeout.connect(self._do_apply_filters)
+
+        # 加载线程
+        self._loader_thread = None
+        self._is_loading = False
+
         self._init_ui()
-        self._load_log_files()
+        self._start_async_load()
 
     def _init_ui(self):
         """初始化界面"""
@@ -50,8 +156,83 @@ class LogViewerDialog(QDialog):
         left_layout = QVBoxLayout(left_w)
         left_layout.setContentsMargins(0, 0, 0, 0)
 
+        # 过滤区域
+        filter_group = QGroupBox("筛选条件")
+        filter_layout = QVBoxLayout()
+        filter_layout.setSpacing(8)
+
+        # 文件名搜索
+        filename_layout = QHBoxLayout()
+        filename_layout.addWidget(QLabel("文件名:"))
+        self.filename_filter = QLineEdit()
+        self.filename_filter.setPlaceholderText("搜索文件名...")
+        # 使用去抖动定时器，减少频繁触发
+        self.filename_filter.textChanged.connect(self._apply_filters_debounced)
+        filename_layout.addWidget(self.filename_filter)
+        filter_layout.addLayout(filename_layout)
+
+        # 时间范围筛选
+        time_layout = QHBoxLayout()
+        time_layout.addWidget(QLabel("时间范围:"))
+        self.time_range_combo = QComboBox()
+        self.time_range_combo.addItems([
+            "全部时间",
+            "最近1小时",
+            "最近24小时",
+            "最近3天",
+            "最近7天",
+            "最近30天",
+            "自定义范围"
+        ])
+        self.time_range_combo.currentIndexChanged.connect(self._on_time_range_changed)
+        time_layout.addWidget(self.time_range_combo, 1)
+        filter_layout.addLayout(time_layout)
+
+        # 自定义日期范围（默认隐藏）
+        self.custom_date_widget = QWidget()
+        custom_date_layout = QVBoxLayout(self.custom_date_widget)
+        custom_date_layout.setContentsMargins(0, 0, 0, 0)
+        custom_date_layout.setSpacing(4)
+
+        start_layout = QHBoxLayout()
+        start_layout.addWidget(QLabel("开始:"))
+        self.start_date = QDateEdit()
+        self.start_date.setCalendarPopup(True)
+        self.start_date.setDate(QDate.currentDate().addDays(-7))
+        self.start_date.dateChanged.connect(self._apply_filters)
+        start_layout.addWidget(self.start_date)
+        custom_date_layout.addLayout(start_layout)
+
+        end_layout = QHBoxLayout()
+        end_layout.addWidget(QLabel("结束:"))
+        self.end_date = QDateEdit()
+        self.end_date.setCalendarPopup(True)
+        self.end_date.setDate(QDate.currentDate())
+        self.end_date.dateChanged.connect(self._apply_filters)
+        end_layout.addWidget(self.end_date)
+        custom_date_layout.addLayout(end_layout)
+
+        self.custom_date_widget.hide()
+        filter_layout.addWidget(self.custom_date_widget)
+
+        # 清除筛选按钮
+        clear_filter_btn = QPushButton("清除筛选")
+        clear_filter_btn.clicked.connect(self._clear_filters)
+        filter_layout.addWidget(clear_filter_btn)
+
+        filter_group.setLayout(filter_layout)
+        left_layout.addWidget(filter_group)
+
+        # 日志列表
         list_label = QLabel("执行记录:")
         left_layout.addWidget(list_label)
+
+        # 加载状态标签
+        self.loading_label = QLabel("正在加载日志文件...")
+        self.loading_label.setStyleSheet("color: #1976d2; padding: 5px;")
+        self.loading_label.setAlignment(Qt.AlignCenter)
+        self.loading_label.hide()  # 默认隐藏
+        left_layout.addWidget(self.loading_label)
 
         self.log_list = QListWidget()
         self.log_list.setMinimumWidth(250)
@@ -60,7 +241,7 @@ class LogViewerDialog(QDialog):
         left_layout.addWidget(self.log_list)
 
         # 刷新按钮
-        refresh_btn = QPushButton("刷新列表")
+        refresh_btn = QPushButton("🔄 刷新列表")
         refresh_btn.clicked.connect(self._load_log_files)
         left_layout.addWidget(refresh_btn)
 
@@ -86,13 +267,27 @@ class LogViewerDialog(QDialog):
         # 底部按钮
         btn_layout = QHBoxLayout()
 
-        export_btn = QPushButton("导出日志")
+        export_btn = QPushButton("📤 导出日志")
         export_btn.clicked.connect(self._export_log)
         btn_layout.addWidget(export_btn)
 
-        delete_btn = QPushButton("删除此日志")
+        delete_btn = QPushButton("🗑️ 删除此日志")
         delete_btn.clicked.connect(self._delete_log)
         btn_layout.addWidget(delete_btn)
+
+        delete_all_btn = QPushButton("🗑️ 删除全部日志")
+        delete_all_btn.clicked.connect(self._delete_all_logs)
+        delete_all_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #d32f2f;
+                color: white;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #f44336;
+            }
+        """)
+        btn_layout.addWidget(delete_all_btn)
 
         btn_layout.addStretch()
 
@@ -236,69 +431,222 @@ class LogViewerDialog(QDialog):
             }
         """
     
+    def _start_async_load(self):
+        """开始异步加载日志文件"""
+        # 如果已经在加载，取消之前的加载
+        if self._loader_thread and self._loader_thread.isRunning():
+            self._loader_thread.cancel()
+            self._loader_thread.wait(1000)  # 等待最多1秒
+
+        # 显示加载状态
+        self.loading_label.setText("正在加载日志文件...")
+        self.loading_label.show()
+        self.log_list.hide()
+        self._is_loading = True
+
+        # 创建并启动加载线程
+        self._loader_thread = LogFileLoader(self.log_dir, self.task_name)
+        self._loader_thread.progress.connect(self._on_load_progress)
+        self._loader_thread.finished.connect(self._on_load_finished)
+        self._loader_thread.error.connect(self._on_load_error)
+        self._loader_thread.start()
+
+    def _on_load_progress(self, current: int, total: int):
+        """加载进度更新"""
+        if total > 0:
+            self.loading_label.setText(f"正在加载日志文件... {current}/{total}")
+        else:
+            self.loading_label.setText(f"正在加载日志文件... ({current} 个)")
+
+    def _on_load_finished(self, files: list):
+        """加载完成"""
+        self._is_loading = False
+        self.loading_label.hide()
+        self.log_list.show()
+
+        # 保存文件列表
+        self._all_log_files = files
+
+        # 应用过滤
+        self._do_apply_filters()
+
+        # 如果没有日志文件，显示提示
+        if not files:
+            self.log_content.setPlainText(f"暂无执行日志记录\n\n任务: {self.task_name}\n日志目录: {self.log_dir}")
+
+    def _on_load_error(self, error_msg: str):
+        """加载错误"""
+        self._is_loading = False
+        self.loading_label.hide()
+        self.log_list.show()
+
+        self.log_content.setPlainText(f"加载日志失败\n\n错误: {error_msg}\n\n任务: {self.task_name}\n日志目录: {self.log_dir}")
+        self._all_log_files = []
+
     def _load_log_files(self):
-        """加载日志文件列表"""
+        """手动刷新日志文件列表（点击刷新按钮时调用）"""
+        self._start_async_load()
+
+    def _apply_filters_debounced(self):
+        """去抖动的筛选触发（延迟300ms）"""
+        self._filter_timer.stop()
+        self._filter_timer.start(300)  # 300ms延迟
+
+    def _apply_filters(self):
+        """立即应用筛选（用于下拉框等需要立即响应的场景）"""
+        self._filter_timer.stop()
+        self._do_apply_filters()
+
+    def _parse_display_time(self, filename: str, mtime: float) -> str:
+        """解析文件名中的时间（优化版本）"""
+        try:
+            # 文件名格式: taskname_YYYYMMDD_HHMMSS.log
+            # 从后往前查找，避免任务名中包含下划线的情况
+            name_without_ext = filename[:-4]  # 去掉 .log
+            parts = name_without_ext.rsplit('_', 2)
+
+            if len(parts) >= 3:
+                date_str = parts[-2]
+                time_str = parts[-1]
+
+                # 快速验证格式
+                if len(date_str) == 8 and len(time_str) == 6:
+                    if date_str.isdigit() and time_str.isdigit():
+                        # 格式化时间字符串
+                        return f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]} {time_str[:2]}:{time_str[2:4]}:{time_str[4:]}"
+        except (IndexError, ValueError):
+            pass
+
+        # 降级方案：使用文件修改时间
+        return datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M:%S')
+
+    def _do_apply_filters(self):
+        """应用筛选条件（优化：减少UI更新）"""
+        # 暂时禁用信号以提高性能
+        self.log_list.blockSignals(True)
         self.log_list.clear()
 
-        # 清理任务名用于匹配文件（与 logger.py 中的逻辑保持一致）
-        safe_name = "".join(c if c.isalnum() or c in ('-', '_', ' ') else '_' for c in self.task_name)
-        safe_name = safe_name.strip().replace(' ', '_')
-
-        # 确保日志目录存在
-        if not os.path.exists(self.log_dir):
-            try:
-                os.makedirs(self.log_dir)
-            except OSError:
-                pass
+        if not self._all_log_files:
             self.log_content.setPlainText(f"暂无执行日志记录\n\n任务: {self.task_name}\n日志目录: {self.log_dir}")
+            self.log_list.blockSignals(False)
             return
 
-        files = []
-        for f in os.listdir(self.log_dir):
-            # 匹配当前任务的日志文件
-            if f.endswith('.log') and f.startswith(safe_name + '_'):
-                filepath = os.path.join(self.log_dir, f)
-                mtime = os.path.getmtime(filepath)
-                files.append((f, filepath, mtime))
+        # 获取筛选条件
+        filename_filter = self.filename_filter.text().strip().lower()
+        time_range_index = self.time_range_combo.currentIndex()
 
-        # 按时间倒序
-        files.sort(key=lambda x: x[2], reverse=True)
+        # 计算时间范围
+        now = datetime.now()
+        start_time = None
+        end_time = now
 
-        for filename, filepath, mtime in files:
-            # 解析时间显示
-            try:
-                # 文件名格式: taskname_YYYYMMDD_HHMMSS.log
-                parts = filename.rsplit('_', 2)
-                if len(parts) >= 3:
-                    date_str = parts[-2]
-                    time_str = parts[-1].replace('.log', '')
-                    display_time = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]} {time_str[:2]}:{time_str[2:4]}:{time_str[4:]}"
-                else:
-                    display_time = datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M:%S')
-            except:
-                display_time = datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M:%S')
+        if time_range_index == 1:  # 最近1小时
+            start_time = now - timedelta(hours=1)
+        elif time_range_index == 2:  # 最近24小时
+            start_time = now - timedelta(days=1)
+        elif time_range_index == 3:  # 最近3天
+            start_time = now - timedelta(days=3)
+        elif time_range_index == 4:  # 最近7天
+            start_time = now - timedelta(days=7)
+        elif time_range_index == 5:  # 最近30天
+            start_time = now - timedelta(days=30)
+        elif time_range_index == 6:  # 自定义范围
+            start_qdate = self.start_date.date()
+            end_qdate = self.end_date.date()
+            start_time = datetime(start_qdate.year(), start_qdate.month(), start_qdate.day())
+            end_time = datetime(end_qdate.year(), end_qdate.month(), end_qdate.day(), 23, 59, 59)
 
+        # 过滤文件
+        filtered_files = []
+        for filename, filepath, mtime, display_time in self._all_log_files:
+            # 文件名过滤
+            if filename_filter and filename_filter not in filename.lower():
+                continue
+
+            # 时间范围过滤
+            file_time = datetime.fromtimestamp(mtime)
+            if start_time and file_time < start_time:
+                continue
+            if end_time and file_time > end_time:
+                continue
+
+            filtered_files.append((filename, filepath, mtime, display_time))
+
+        # 批量添加到列表（减少重绘）
+        from PyQt5.QtWidgets import QListWidgetItem
+
+        # 限制显示数量，防止卡顿
+        max_display = 500  # 最多显示500条
+        if len(filtered_files) > max_display:
+            self.log_content.setPlainText(
+                f"⚠️ 过滤结果过多（{len(filtered_files)} 条）\n"
+                f"仅显示最新的 {max_display} 条日志\n"
+                f"请使用更精确的筛选条件"
+            )
+            filtered_files = filtered_files[-max_display:]  # 只取最新的
+
+        for filename, filepath, mtime, display_time in filtered_files:
             item = QListWidgetItem(display_time)
             item.setData(Qt.UserRole, filepath)
+            item.setToolTip(filename)
             self.log_list.addItem(item)
 
+        # 恢复信号
+        self.log_list.blockSignals(False)
+
+        # 显示过滤结果
         if self.log_list.count() == 0:
-            self.log_content.setPlainText(f"暂无执行日志记录\n\n任务: {self.task_name}\n日志目录: {self.log_dir}\n匹配前缀: {safe_name}_")
+            self.log_content.setPlainText(
+                f"没有符合筛选条件的日志\n\n"
+                f"总日志数: {len(self._all_log_files)}\n"
+                f"筛选结果: 0"
+            )
         elif self.log_list.count() > 0:
+            # 选择第一项（会触发信号）
             self.log_list.setCurrentRow(0)
 
+    def _on_time_range_changed(self, index):
+        """时间范围改变"""
+        # 显示/隐藏自定义日期范围
+        self.custom_date_widget.setVisible(index == 6)
+        self._apply_filters()
+
+    def _clear_filters(self):
+        """清除所有筛选条件"""
+        self.filename_filter.clear()
+        self.time_range_combo.setCurrentIndex(0)
+        self.custom_date_widget.hide()
+        self._apply_filters()
+
     def _on_log_selected(self, current, _previous):
-        """选择日志文件"""
+        """选择日志文件（优化：限制大文件加载）"""
         if not current:
             return
 
         filepath = current.data(Qt.UserRole)
         if filepath and os.path.exists(filepath):
             try:
-                with open(filepath, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                self._original_content = content
-                self.log_content.setPlainText(content)
+                # 检查文件大小
+                file_size = os.path.getsize(filepath)
+                max_size = 10 * 1024 * 1024  # 10MB限制
+
+                if file_size > max_size:
+                    # 文件太大，只读取最后部分
+                    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                        f.seek(max(0, file_size - max_size))
+                        content = f.read()
+                    self._original_content = content
+                    self.log_content.setPlainText(
+                        f"⚠️ 日志文件过大（{file_size / 1024 / 1024:.2f} MB），仅显示最后 10MB\n"
+                        f"{'='*60}\n\n" + content
+                    )
+                else:
+                    # 正常读取
+                    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
+                    self._original_content = content
+                    self.log_content.setPlainText(content)
+
                 # 清除搜索状态
                 self._search_matches = []
                 self._current_match_index = -1
@@ -535,6 +883,95 @@ class LogViewerDialog(QDialog):
             except Exception as e:
                 MsgBox.critical(self, "错误", f"删除失败: {e}")
 
+    def _delete_all_logs(self):
+        """删除全部显示的日志（受筛选影响）"""
+        from PyQt5.QtWidgets import QProgressDialog
+        from PyQt5.QtCore import Qt as QtCore_Qt
+
+        # 获取当前显示的日志文件列表
+        displayed_files = []
+        for i in range(self.log_list.count()):
+            item = self.log_list.item(i)
+            filepath = item.data(Qt.UserRole)
+            if filepath:  # 确保路径有效
+                displayed_files.append(filepath)
+
+        if not displayed_files:
+            MsgBox.information(self, "提示", "没有可删除的日志文件")
+            return
+
+        total_count = len(displayed_files)
+        all_count = len(self._all_log_files)
+
+        # 二次确认
+        if total_count == all_count:
+            confirm_msg = f"确定要删除当前任务的全部 {total_count} 条日志吗？"
+        else:
+            confirm_msg = f"确定要删除当前显示的 {total_count} 条日志吗？\n（共有 {all_count} 条日志，当前已应用筛选）"
+
+        reply = MsgBox.question(
+            self,
+            "⚠️ 危险操作",
+            f"{confirm_msg}\n\n"
+            f"任务名称: {self.task_name}\n"
+            f"此操作无法撤销！",
+            default_no=True
+        )
+
+        if not reply:
+            return
+
+        # 创建进度对话框
+        progress = QProgressDialog("正在删除日志文件...", "取消", 0, total_count, self)
+        progress.setWindowTitle("删除进度")
+        progress.setWindowModality(QtCore_Qt.WindowModal)
+        progress.setMinimumDuration(0)  # 立即显示
+        progress.setValue(0)
+
+        # 执行删除
+        success_count = 0
+        failed_files = []
+
+        for idx, filepath in enumerate(displayed_files):
+            # 更新进度
+            progress.setValue(idx)
+            progress.setLabelText(f"正在删除 ({idx + 1}/{total_count})...\n{os.path.basename(filepath)}")
+
+            # 检查是否取消
+            if progress.wasCanceled():
+                break
+
+            try:
+                if os.path.exists(filepath):
+                    os.remove(filepath)
+                    success_count += 1
+                else:
+                    failed_files.append((os.path.basename(filepath), "文件不存在"))
+            except PermissionError:
+                failed_files.append((os.path.basename(filepath), "权限不足"))
+            except Exception as e:
+                failed_files.append((os.path.basename(filepath), str(e)))
+
+        progress.setValue(total_count)
+        progress.close()
+
+        # 显示结果
+        if progress.wasCanceled():
+            MsgBox.information(self, "已取消", f"已删除 {success_count} 条日志，操作已取消")
+        elif failed_files:
+            error_msg = f"成功删除 {success_count} 条日志\n失败 {len(failed_files)} 条:\n\n"
+            for fname, err in failed_files[:5]:  # 最多显示5条错误
+                error_msg += f"• {fname}: {err}\n"
+            if len(failed_files) > 5:
+                error_msg += f"\n... 还有 {len(failed_files) - 5} 条失败"
+            MsgBox.warning(self, "部分删除失败", error_msg)
+        else:
+            MsgBox.information(self, "成功", f"已成功删除 {success_count} 条日志")
+
+        # 重新加载
+        self._load_log_files()
+        self.log_content.clear()
+
     def _show_context_menu(self, pos):
         """显示右键菜单"""
         from PyQt5.QtWidgets import QMenu, QApplication
@@ -568,4 +1005,11 @@ class LogViewerDialog(QDialog):
         if text:
             QApplication.clipboard().setText(text)
             MsgBox.information(self, "提示", "日志内容已复制到剪贴板")
+
+    def closeEvent(self, event):
+        """关闭事件：停止加载线程"""
+        if self._loader_thread and self._loader_thread.isRunning():
+            self._loader_thread.cancel()
+            self._loader_thread.wait(1000)  # 等待最多1秒
+        event.accept()
 
